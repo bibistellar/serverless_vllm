@@ -66,6 +66,10 @@ class FakeEngine:
     def health(self) -> Dict[str, Any]:
         return {"model": self.model_name, "fake": True}
 
+    def maybe_sleep(self):
+        """与真实引擎保持接口一致的 no-op sleep 钩子。"""
+        return None
+
 
 @ray.remote
 class PoolManager:
@@ -81,6 +85,8 @@ class PoolManager:
         self.use_fake = use_fake
         self.engine_options = engine_options or {}
         self.engines_by_model: Dict[str, List[Any]] = {}
+        # 每个模型的轮询调度下标
+        self._rr_index: Dict[str, int] = {}
         self.model_configs: Dict[str, ModelConfig] = {}
         # 记录已经为哪些 node_id 创建过引擎，便于后续增量同步
         self._initialized_node_ids: set[str] = set()
@@ -88,13 +94,16 @@ class PoolManager:
         # 这里只做轻量操作，真正的引擎初始化由显式方法触发
         self._load_config(config_path)
 
-    def init_engines(self) -> Dict[str, int]:
+    async def init_engines(self) -> Dict[str, int]:
         """Lazily create all engines across nodes.
 
         在 Ray actor 创建完成后，由外部显式调用，避免 __init__ 阶段超时。
         返回各模型初始化成功的引擎数量统计。
+
+        异步 actor 内部不得使用 blocking 的 ray.get，这里通过
+        await health.remote() 等待引擎就绪。
         """
-        self._init_engines_on_all_nodes()
+        await self._init_engines_on_all_nodes_async()
         return {k: len(v) for k, v in self.engines_by_model.items()}
 
     def _cluster_gpu_count(self) -> float:
@@ -176,7 +185,7 @@ class PoolManager:
             logger.warning("Failed to load config %s (%s), using default configs", path, exc)
             self.model_configs = self._default_configs()
 
-    def _init_engines_on_all_nodes(self):
+    async def _init_engines_on_all_nodes_async(self) -> None:
         # 没有任何模型配置时，不做初始化，也不标记节点，
         # 以便后续 register_model 注入模型后，watch_cluster 能正确补齐。
         if not self.model_configs:
@@ -201,8 +210,12 @@ class PoolManager:
                             soft=True,
                         )
                     worker = self._spawn_engine(cfg, options)
-                    # Wait for init to finish before spawning next to reduce contention
-                    self._wait_engine_ready(worker)
+                    # 等待当前引擎完成初始化后再创建下一个，串行化以减少资源争用。
+                    try:
+                        await worker.health.remote()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Engine init check failed: %s", exc)
+                        raise
                     self.engines_by_model.setdefault(cfg.name, []).append(worker)
 
             self._initialized_node_ids.add(node_id)
@@ -217,32 +230,44 @@ class PoolManager:
             return self.engine_cls.options(**options).remote(cfg.name)
 
         # Real LLM engine
-        # Allocate GPU for the engine actor; default 1 or tensor_parallel_size
-        options.setdefault("num_gpus", 0.1)
+        # Allocate GPU for the engine actor; 默认占用 1 个 GPU 资源，由 Ray
+        # 决定具体设备；gpu_mem_util 若未在配置中显式给出，则传 None，
+        # 交由 LLMEngineWorker 根据当前 GPU 显存自动估算（以 16GiB 为目标）。
+        options.setdefault("num_gpus", 1)
+        gpu_mem_util = cfg.gpu_memory_utilization
         return self.engine_cls.options(**options).remote(
             model_name=cfg.name,
             model_repo=cfg.repo or cfg.name,
             sleep_level=2,
             max_model_len=cfg.max_model_len or 16000,
             tensor_parallel_size=cfg.tensor_parallel_size or 1,
-            gpu_mem_util=cfg.gpu_memory_utilization or 0.7,
+            gpu_mem_util=gpu_mem_util,
             default_max_tokens=cfg.default_max_tokens,
             default_temperature=cfg.default_temperature,
             top_p_default=0.9,
         )
 
-    def _wait_engine_ready(self, worker):
-        try:
-            return ray.get(worker.health.remote())
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Engine init check failed: %s", exc)
-            raise
-
     def get_engine_for_request(self, model_name: str):
         engines = self.engines_by_model.get(model_name, [])
         if not engines:
             raise RuntimeError(f"No engines for model {model_name}")
-        return random.choice(engines)
+        # 简单轮询调度：对于同一模型，在其引擎列表上依次取用，
+        # 避免单点过载，也让 QPS 在多个 worker 之间更均匀。
+        idx = self._rr_index.get(model_name, 0)
+        pos = idx % len(engines)
+        engine = engines[pos]
+        self._rr_index[model_name] = (idx + 1) % len(engines)
+
+        # 记录调度决策，便于排查多节点下的负载分布情况。
+        # engine 本身是一个 ActorHandle，这里直接打印其 repr。 
+        logger.info(
+            "Dispatch model %s to engine[%d/%d]: %s",
+            model_name,
+            pos,
+            len(engines),
+            engine,
+        )
+        return engine
 
     def list_models(self) -> List[str]:
         return list(self.model_configs)
@@ -256,12 +281,12 @@ class PoolManager:
         """
         while True:
             try:
-                self._init_engines_on_all_nodes()
+                await self._init_engines_on_all_nodes_async()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("watch_cluster sync failed: %s", exc)
             await asyncio.sleep(interval_s)
 
-    def register_model(self, alias: str, full_name: str) -> Dict[str, Any]:
+    async def register_model(self, alias: str, full_name: str) -> Dict[str, Any]:
         """Register a new model at runtime.
 
         参数：
@@ -271,7 +296,8 @@ class PoolManager:
         其余参数按照当前配置文件中的默认策略：
         - max_model_len: 沿用已有模型的 max_model_len（若有），否则 8192
         - tensor_parallel_size: 1
-        - gpu_memory_utilization: 0.8
+                - gpu_memory_utilization: 若模板中未设置则为 None，由 LLMEngineWorker
+                    根据当前 GPU 显存自动估算（约 16GiB 预算）
         - num_engines_per_node: 1
         - default_max_tokens: 512
         - default_temperature: 0.2
@@ -289,11 +315,12 @@ class PoolManager:
 
         max_model_len = template_cfg.max_model_len if template_cfg else 8192
         tensor_parallel_size = template_cfg.tensor_parallel_size or 1 if template_cfg else 1
-        gpu_memory_utilization = (
-            template_cfg.gpu_memory_utilization
-            if template_cfg and template_cfg.gpu_memory_utilization is not None
-            else 0.8
-        )
+        # 若模板中没有显式配置 gpu_memory_utilization，则保持为 None，交由
+        # LLMEngineWorker 在每个 worker 进程内根据当前 GPU free/total 自动估算。
+        if template_cfg and template_cfg.gpu_memory_utilization is not None:
+            gpu_memory_utilization = template_cfg.gpu_memory_utilization
+        else:
+            gpu_memory_utilization = None
         num_engines_per_node = template_cfg.num_engines_per_node if template_cfg else 1
         default_max_tokens = template_cfg.default_max_tokens if template_cfg else 512
         default_temperature = template_cfg.default_temperature if template_cfg else 0.2
@@ -316,7 +343,6 @@ class PoolManager:
         if not nodes:
             nodes = [{"NodeID": None}]
 
-        created = 0
         for node in nodes:
             raw_node_id = node.get("NodeID")
             node_id = raw_node_id or "__LOCAL__"
@@ -329,17 +355,19 @@ class PoolManager:
                         soft=True,
                     )
                 worker = self._spawn_engine(cfg, options)
-                self._wait_engine_ready(worker)
+                try:
+                    await worker.health.remote()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Engine init check failed: %s", exc)
+                    raise
                 self.engines_by_model.setdefault(alias, []).append(worker)
-                created += 1
 
             # 标记该节点已为当前所有模型初始化过，引擎补齐由 watch_cluster
             # 针对“新节点”来处理，避免后续周期性检查重复创建引擎。
             self._initialized_node_ids.add(node_id)
 
-        logger.info("Registered model %s (%s), engines=%d", alias, full_name, created)
+        logger.info("Registered model %s (%s)", alias, full_name)
         return {
             "alias": alias,
-            "full_name": full_name,
-            "engines": created,
+            "full_name": full_name
         }

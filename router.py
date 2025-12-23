@@ -14,9 +14,6 @@ class VadLLMRouter:
         body = await request.json()
         model = body["model"]
         messages = body["messages"]
-
-        # 1. 将 messages 拼成一个 prompt（简单策略）
-        prompt = self._build_prompt(messages)
         max_tokens = body.get("max_tokens")
         temperature = body.get("temperature")
 
@@ -27,9 +24,13 @@ class VadLLMRouter:
             try:
                 engine_ref = await self.pool.get_engine_for_request.remote(model)
 
-                # 3. 构造内部请求
+                # 3. 构造内部请求：只透传原始 messages，由后端引擎负责
+                # 使用 chat_template 等构造真正的 prompt，避免在 Router
+                # 中重复维护 prompt 逻辑。
                 internal_req = {
-                    "prompt": prompt,
+                    "prompt": "",  # 兼容旧字段，不再在这里构造 prompt
+                    # 传递原始 messages，交由 LLMEngineWorker 解析
+                    "messages": messages,
                     "max_tokens": max_tokens,
                     "temperature": temperature,
                 }
@@ -37,13 +38,20 @@ class VadLLMRouter:
                 # 4. 调用 engine.generate
                 output = await engine_ref.generate.remote(internal_req)
                 text = output.get("text")
+
+                # 5. 结果返回后，以 fire-and-forget 方式触发引擎进入
+                # sleep 模式，具体策略由引擎内部的 sleep_level 控制。
+                try:
+                    engine_ref.maybe_sleep.remote()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("engine maybe_sleep failed: %s", exc)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Pool not ready, return fake response: %s", exc)
 
         if text is None:
-            text = self._fake_completion(prompt, model)
+            text = self._fake_completion(messages, model)
 
-        # 5. 组装 Chat Completion 响应
+        # 6. 组装 Chat Completion 响应
         resp = {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "model": model,
@@ -97,19 +105,35 @@ class VadLLMRouter:
 
         return JSONResponse(result)
 
-    def _build_prompt(self, messages):
-        # 简单拼接，可以后续换成更复杂的模板
-        parts = []
-        for m in messages:
-            role = m["role"]
-            content = m["content"]
-            parts.append(f"{role.upper()}: {content}")
-        return "\n".join(parts)
+    def _fake_completion(self, messages, model: str) -> str:
+        """构造一个简单的假响应，用于 Pool 不可用时的联调。
 
-    def _fake_completion(self, prompt: str, model: str) -> str:
-        # 提供一段可视化结果，便于前端联调
-        snippet = (prompt or "")[:200]
-        suffix = "..." if snippet and len(prompt) > len(snippet) else ""
+        这里不再尝试重建模型实际使用的 prompt，只粗略取首条
+        user 文本内容，避免与 LLMEngineWorker 的 prompt 逻辑重复。
+        """
+        first_text = ""
+        try:
+            for m in messages or []:
+                if m.get("role") != "user":
+                    continue
+                content = m.get("content")
+                if isinstance(content, str):
+                    first_text = content
+                    break
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            txt = block.get("text")
+                            if isinstance(txt, str):
+                                first_text = txt
+                                break
+                    if first_text:
+                        break
+        except Exception:
+            first_text = ""
+
+        snippet = (first_text or "")[:200]
+        suffix = "..." if snippet and len(first_text) > len(snippet) else ""
         return f"[fake completion for {model}] {snippet}{suffix}"
 
     # Ray Serve 入口：映射到 /v1/chat/completions 路由
