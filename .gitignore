@@ -2,3 +2,8 @@
 load.py
 models/
 test.py
+vllm_api.py
+lazy_load_test.py
+demo.jpeg
+test_qwen3_vl_service.py
+torch_kv_cache_demo.py

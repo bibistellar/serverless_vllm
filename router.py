@@ -2,6 +2,7 @@ import uuid
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from ray import logger, serve
+from qwen_vl_utils import process_vision_info
 import ray
 
 @serve.deployment()
@@ -38,13 +39,6 @@ class VadLLMRouter:
                 # 4. 调用 engine.generate
                 output = await engine_ref.generate.remote(internal_req)
                 text = output.get("text")
-
-                # 5. 结果返回后，以 fire-and-forget 方式触发引擎进入
-                # sleep 模式，具体策略由引擎内部的 sleep_level 控制。
-                try:
-                    engine_ref.maybe_sleep.remote()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("engine maybe_sleep failed: %s", exc)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Pool not ready, return fake response: %s", exc)
 
@@ -105,6 +99,40 @@ class VadLLMRouter:
 
         return JSONResponse(result)
 
+    async def unregister_model(self, request: Request):
+        """从 PoolManager 中注销模型并释放资源。
+
+        请求体示例：
+        {
+          "alias": "qwen3-vl-2b"
+        }
+        """
+        if self.pool is None:
+            return JSONResponse(
+                {"error": "PoolManager not available"},
+                status_code=503,
+            )
+
+        body = await request.json()
+        alias = body.get("alias")
+
+        if not alias:
+            return JSONResponse(
+                {"error": "alias is required"},
+                status_code=400,
+            )
+
+        try:
+            result = await self.pool.unregister_model.remote(alias)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("unregister_model failed: %s", exc)
+            return JSONResponse(
+                {"error": f"unregister_model failed: {exc}"},
+                status_code=500,
+            )
+
+        return JSONResponse(result)
+
     def _fake_completion(self, messages, model: str) -> str:
         """构造一个简单的假响应，用于 Pool 不可用时的联调。
 
@@ -144,5 +172,7 @@ class VadLLMRouter:
             return await self.chat_completions(request)
         if path.endswith("/models/register"):
             return await self.register_model(request)
+        if path.endswith("/models/unregister"):
+            return await self.unregister_model(request)
         else:
             return JSONResponse({"error": "not found"}, status_code=404)

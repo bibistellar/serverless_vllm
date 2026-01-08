@@ -1,6 +1,8 @@
 import ray
+import os
 from ray import logger, serve
 from wandb import config
+from pathlib import Path
 
 from pool_manager import PoolManager
 from router import VadLLMRouter
@@ -10,23 +12,34 @@ def main() -> None:
 
     # 优先连接已有 Ray 集群，失败则退回本地单机模式
     try:
-        ray.init(address="auto")
+        project_root = Path(__file__).resolve().parent
+        ray.init(
+            address="auto",
+            namespace="serverless_vllm",
+            runtime_env={
+                "env_vars": {"HF_ENDPOINT": "https://hf-mirror.com"},
+                "working_dir": str(project_root), 
+                # 如需一起装依赖可加：
+                # "pip": [],
+            },
+        )
     except Exception as exc:  # noqa: BLE001
         ray.logger.warning("ray.init(address='auto') failed (%s), fallback to local mode", exc)
-        ray.init()
-    serve.start(http_options={"host": "0.0.0.0", "port": 18000})
+        # 本地模式下也使用独立 namespace，避免与其他 Serve 服务共享默认空间。
+        ray.init(namespace="serverless_vllm")
+        serve.start(
+            proxy_location="EveryNode", # 或者直接用字符串 "EveryNode"
+            http_options={
+                "host": "0.0.0.0",
+                "port": 18000
+            }
+        )
 
-    # 若当前环境无可用 GPU，则退回假引擎，避免 vLLM 抛错
-    resources = ray.available_resources()
-    use_fake = resources.get("GPU", 0) < 0.01
-    if use_fake:
-        logger.warning("No GPUs detected by Ray; PoolManager will use FakeEngine")
-
-    # 先创建 PoolManager actor（轻量），再显式初始化引擎，避免 __init__ 阶段超时
-    pool = PoolManager.remote(
+    # 先创建 PoolManager actor（轻量），再显式初始化引擎，避免 __init__ 阶段超时。
+    # 为了便于调试和从外部脚本获取 handle，这里为 actor 命名。
+    pool = PoolManager.options(name="llm_pool_manager").remote(
         # config_path="model_config.yaml",
         config_path=None,
-        use_fake=use_fake,
     )
     # 串行触发引擎初始化，确保完成后再对外提供服务
     init_stats = ray.get(pool.init_engines.remote())
@@ -57,8 +70,8 @@ def main() -> None:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        ray.logger.info("收到中断信号，正在关闭 Ray Serve...")
-        serve.shutdown()
+        ray.logger.info("收到中断信号，正在关闭 llm_pool...")
+        serve.delete("llm_pool") # 如果只想删这一个应用，用这个
         ray.shutdown()
 
 
