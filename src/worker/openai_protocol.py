@@ -134,27 +134,25 @@ def format_chat_completion_chunk(
     
     return f"data: {json.dumps(chunk)}\n\n"
 
-async def load_image_from_url(image_url: str) -> Image.Image:
-    """从URL或base64加载图片
+async def load_image_from_base64(image_data: str) -> Image.Image:
+    """从base64加载图片
     
     Args:
-        image_url: 图片URL或base64字符串
+        image_data: base64编码的图片数据（可能包含data URI前缀）
         
     Returns:
         PIL.Image对象
     """
-    if image_url.startswith('data:image'):
-        # Base64编码的图片
+    # 如果是data URI格式，提取base64部分
+    if image_data.startswith('data:image'):
         # 格式: data:image/jpeg;base64,/9j/4AAQ...
-        header, encoded = image_url.split(',', 1)
-        image_data = base64.b64decode(encoded)
-        return Image.open(io.BytesIO(image_data))
+        header, encoded = image_data.split(',', 1)
+        image_bytes = base64.b64decode(encoded)
     else:
-        # HTTP(S) URL
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(image_url)
-            response.raise_for_status()
-            return Image.open(io.BytesIO(response.content))
+        # 直接是base64字符串
+        image_bytes = base64.b64decode(image_data)
+    
+    return Image.open(io.BytesIO(image_bytes))
 
 
 async def process_multimodal_content(content: Union[str, List[Dict]]) -> tuple[str, Optional[List[Image.Image]]]:
@@ -165,6 +163,9 @@ async def process_multimodal_content(content: Union[str, List[Dict]]) -> tuple[s
         
     Returns:
         (text, images) 元组
+        
+    Note:
+        只支持base64编码的图片，不支持URL下载
     """
     if isinstance(content, str):
         return content, None
@@ -189,12 +190,17 @@ async def process_multimodal_content(content: Union[str, List[Dict]]) -> tuple[s
                 url = image_url_data
                 
             if url:
+                # 只处理base64格式的图片
+                if not url.startswith('data:image'):
+                    logger.warning(f"Skipping non-base64 image URL. Please encode images as base64.")
+                    continue
+                    
                 try:
-                    image = await load_image_from_url(url)
+                    image = await load_image_from_base64(url)
                     images.append(image)
                 except Exception as e:
-                    logger.error(f"Failed to load image from {url}: {e}")
-                    raise ValueError(f"Failed to load image: {e}")
+                    logger.error(f"Failed to load image from base64: {e}")
+                    raise ValueError(f"Failed to decode image: {e}")
     
     text = ' '.join(text_parts) if text_parts else ''
     return text, images if images else None

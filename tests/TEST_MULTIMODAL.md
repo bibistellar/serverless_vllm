@@ -6,13 +6,13 @@
 
 已实现以下多模态功能：
 
-1. ✅ 支持图片URL（HTTP/HTTPS）
-2. ✅ 支持base64编码的图片
-3. ✅ 支持单张或多张图片
-4. ✅ 向后兼容纯文本模式
-5. ✅ 使用tokenizer的chat template
-6. ✅ 自动下载和处理图片
-7. ✅ 传递多模态数据给vLLM引擎
+1. ✅ 支持base64编码的图片
+2. ✅ 支持单张或多张图片
+3. ✅ 向后兼容纯文本模式
+4. ✅ 使用tokenizer的chat template
+5. ✅ 传递多模态数据给vLLM引擎
+
+**注意：** 为了简化实现和提高可靠性，当前只支持base64编码的图片，不支持URL下载。请在客户端将图片编码为base64后再发送。
 
 ## 前提条件
 
@@ -65,60 +65,40 @@ cd /root/Code/serverless_vllm
 
 ### 方法3: 直接curl命令
 
-**单张图片：**
+**注意：** 需要先将图片转换为base64。
+
+首先准备图片的base64编码：
 ```bash
-curl -X POST http://localhost:18000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen-vl-2b",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {
-            "type": "image_url",
-            "image_url": {
-              "url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
-            }
-          },
-          {
-            "type": "text",
-            "text": "请描述这张图片的内容。"
-          }
-        ]
-      }
-    ],
-    "max_tokens": 512
-  }'
+# Linux/Mac
+base64 -w 0 image.jpg > image_base64.txt
+
+# 或者使用Python
+python3 -c "import base64; print(base64.b64encode(open('image.jpg','rb').read()).decode())" > image_base64.txt
 ```
 
-**多张图片：**
+然后使用curl发送（需要将IMAGE_BASE64替换为实际的base64字符串）：
 ```bash
 curl -X POST http://localhost:18000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen-vl-2b",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {
-            "type": "image_url",
-            "image_url": {"url": "https://example.com/image1.jpg"}
-          },
-          {
-            "type": "image_url",
-            "image_url": {"url": "https://example.com/image2.jpg"}
-          },
-          {
-            "type": "text",
-            "text": "比较这两张图片的异同。"
+  -d "{
+    \"model\": \"qwen-vl-2b\",
+    \"messages\": [{
+      \"role\": \"user\",
+      \"content\": [
+        {
+          \"type\": \"image_url\",
+          \"image_url\": {
+            \"url\": \"data:image/jpeg;base64,IMAGE_BASE64_HERE\"
           }
-        ]
-      }
-    ],
-    "max_tokens": 512
-  }'
+        },
+        {
+          \"type\": \"text\",
+          \"text\": \"请描述这张图片的内容。\"
+        }
+      ]
+    }],
+    \"max_tokens\": 512
+  }"
 ```
 
 **使用base64编码的本地图片：**

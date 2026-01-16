@@ -36,7 +36,7 @@ def encode_image_to_base64(image_path: str) -> str:
 def test_single_image():
     """测试单张图片的理解"""
     print("\n" + "="*60)
-    print("测试 1: 单张图片理解")
+    print("测试 1: 单张图片理解（Base64编码）")
     print("="*60)
     
     # 创建客户端
@@ -46,13 +46,31 @@ def test_single_image():
         timeout=600
     )
     
-    # 准备测试图片（这里使用一个示例，需要替换为实际图片）
-    # 你可以下载一张测试图片，或者使用URL
-    image_url = "https://ofasys-multimodal-wlcb-3-toshanghai.oss-accelerate.aliyuncs.com/wpf272043/keepme/image/receipt.png"
+    # 检查是否有测试图片
+    test_image_paths = [
+        "tests/test_image.jpg",
+        "tests/test_image.png",
+        "demo.jpg",
+        "demo.png"
+    ]
     
-    # 或者使用本地图片（如果有的话）
-    # local_image_path = "/path/to/your/image.jpg"
-    # image_base64 = encode_image_to_base64(local_image_path)
+    local_image = None
+    for path in test_image_paths:
+        if Path(path).exists():
+            local_image = path
+            break
+    
+    if not local_image:
+        print("⚠️  未找到本地测试图片，跳过此测试")
+        print(f"提示: 请在以下位置放置测试图片:")
+        for path in test_image_paths:
+            print(f"  - {path}")
+        return
+    
+    print(f"使用本地图片: {local_image}")
+    
+    # 编码图片为base64
+    image_base64 = encode_image_to_base64(local_image)
     
     messages = [
         {
@@ -61,7 +79,7 @@ def test_single_image():
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": image_url
+                        "url": image_base64
                     }
                 },
                 {
@@ -96,7 +114,7 @@ def test_single_image():
 def test_multiple_images():
     """测试多张图片的理解"""
     print("\n" + "="*60)
-    print("测试 2: 多张图片理解")
+    print("测试 2: 多张图片理解（Base64编码）")
     print("="*60)
     
     client = OpenAI(
@@ -105,18 +123,37 @@ def test_multiple_images():
         timeout=600
     )
     
-    # 使用多张图片（URL或base64）
-    images = [
-        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
-        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo2.jpeg"
+    # 查找多张测试图片
+    test_image_paths = [
+        "tests/test_image.jpg",
+        "tests/test_image.png", 
+        "tests/test_image2.jpg",
+        "tests/test_image2.png",
+        "demo.jpg",
+        "demo.png"
     ]
+    
+    found_images = []
+    for path in test_image_paths:
+        if Path(path).exists() and path not in found_images:
+            found_images.append(path)
+            if len(found_images) >= 2:
+                break
+    
+    if len(found_images) < 2:
+        print("⚠️  未找到足够的测试图片（需要至少2张），跳过此测试")
+        print(f"找到的图片: {found_images}")
+        return
+    
+    print(f"使用图片: {found_images}")
     
     # 构造包含多张图片的消息
     content = []
-    for i, img_url in enumerate(images, 1):
+    for img_path in found_images[:2]:  # 只用前两张
+        image_base64 = encode_image_to_base64(img_path)
         content.append({
             "type": "image_url",
-            "image_url": {"url": img_url}
+            "image_url": {"url": image_base64}
         })
     
     content.append({
@@ -126,7 +163,7 @@ def test_multiple_images():
     
     messages = [{"role": "user", "content": content}]
     
-    print(f"发送包含 {len(images)} 张图片的请求...")
+    print(f"发送包含 {len(found_images[:2])} 张图片的请求...")
     start = time.time()
     
     try:
