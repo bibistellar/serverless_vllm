@@ -211,7 +211,7 @@ class WorkerService:
             
             # 获取 tokenizer 并转换 messages 为 prompt（支持图片）
             try:
-                tokenizer = self.vllm_manager.get_tokenizer(alias)
+                tokenizer = await self.vllm_manager.get_tokenizer(alias)
                 prompt, images = await messages_to_prompt_and_images(
                     request.messages,
                     tokenizer,

@@ -142,18 +142,18 @@ class VLLMManager:
             async for output in engine.generate(prompt, sampling_params, request_id):
                 yield output
     
-    def get_tokenizer(self, alias: str):
+    async def get_tokenizer(self, alias: str):
         """获取指定引擎的tokenizer
         
-        注意：AsyncLLMEngine.get_tokenizer()是同步方法，不是async
+        注意：AsyncLLM.get_tokenizer()是异步方法，需要await
         """
         if alias not in self.engines:
             raise ValueError(f"Engine {alias} not found")
         
         engine = self.engines[alias]
         
-        # AsyncLLMEngine有get_tokenizer()方法（同步方法）
-        return engine.get_tokenizer()
+        # AsyncLLM.get_tokenizer()是异步方法
+        return await engine.get_tokenizer()
     
     async def stop_instance(self, alias: str) -> bool:
         """停止 vLLM 引擎实例"""
