@@ -208,15 +208,33 @@ class WorkerService:
                     detail=f"Instance {alias} is not running (status: {instance.status.value})"
                 )
             
-            # 转换 messages 为 prompt
-            prompt = messages_to_prompt(request.messages)
+            # 获取 tokenizer 并转换 messages 为 prompt
+            try:
+                tokenizer = self.vllm_manager.get_tokenizer(alias)
+                prompt = messages_to_prompt(
+                    request.messages,
+                    tokenizer,
+                    add_generation_prompt=request.add_generation_prompt,
+                    continue_final_message=request.continue_final_message
+                )
+                logger.debug(f"Generated prompt for {alias}: {prompt[:100]}...")
+            except Exception as e:
+                logger.warning(f"Failed to get tokenizer for {alias}: {e}, using fallback")
+                prompt = messages_to_prompt(
+                    request.messages,
+                    None,
+                    add_generation_prompt=request.add_generation_prompt,
+                    continue_final_message=request.continue_final_message
+                )
             
             # 构建采样参数
             sampling_params = convert_to_sampling_params(
                 temperature=request.temperature,
                 top_p=request.top_p,
                 max_tokens=request.max_tokens,
-                stop=request.stop
+                stop=request.stop,
+                top_k=request.top_k,
+                repetition_penalty=request.repetition_penalty
             )
             
             # 生成请求 ID

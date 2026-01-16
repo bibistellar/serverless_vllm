@@ -419,9 +419,11 @@ class ManagerService:
         """在 Worker 上启动 vLLM 实例
         
         注意：模型加载可能需要较长时间（几分钟到十几分钟），所以使用较长的超时
-        使用内网 worker_url 进行管理操作
+        优先使用 public_worker_url，因为 Manager 可能无法访问内网地址
         """
-        url = f"{worker.worker_url}/instances/start"
+        # 优先使用公网URL，如果没有则使用内网URL
+        worker_url = worker.public_worker_url if worker.public_worker_url else worker.worker_url
+        url = f"{worker_url}/instances/start"
         
         payload = {
             "alias": alias,
@@ -443,7 +445,12 @@ class ManagerService:
         worker_url: str,
         alias: str
     ) -> Dict:
-        """停止 Worker 上的 vLLM 实例"""
+        """停止 Worker 上的 vLLM 实例
+        
+        Args:
+            worker_url: Worker 的访问URL（可能是公网或内网）
+            alias: 实例别名
+        """
         url = f"{worker_url}/instances/{alias}/stop"
         
         async with httpx.AsyncClient(timeout=30.0) as client:

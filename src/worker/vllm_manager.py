@@ -110,7 +110,7 @@ class VLLMManager:
         
         Args:
             alias: 实例别名
-            prompt: 输入文本
+            prompt: 输入文本（已经应用chat template）
             sampling_params: 采样参数
             
         Yields:
@@ -130,6 +130,12 @@ class VLLMManager:
         # 调用引擎生成（AsyncLLMEngine.generate 返回异步生成器）
         async for output in engine.generate(prompt, sampling_params, request_id):
             yield output
+    
+    def get_tokenizer(self, alias: str):
+        """获取指定引擎的tokenizer"""
+        if alias not in self.engines:
+            raise ValueError(f"Engine {alias} not found")
+        return self.engines[alias].engine.tokenizer
     
     async def stop_instance(self, alias: str) -> bool:
         """停止 vLLM 引擎实例"""
