@@ -1,0 +1,22 @@
+# Core dependencies for new HTTP-based architecture
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+httpx>=0.25.0
+pyyaml>=6.0
+
+# PyTorch and vLLM
+torch>=2.0.0
+vllm>=0.5.0
+transformers>=4.36.0
+
+# Optional: for GPU monitoring
+pynvml>=11.5.0
+
+# Optional: for Qwen-VL support
+qwen-vl-utils
+Pillow>=10.0.0
+uvicorn[standard]>=0.24.0
+httpx>=0.25.0
+pydantic>=2.4.0
+pynvml>=11.5.0
+pyyaml>=6.0.1

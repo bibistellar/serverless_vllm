@@ -1,9 +1,0 @@
-models:
-  qwen3-vl-2b:
-    repo: "Qwen/Qwen3-VL-2B-Instruct"
-    max_model_len: 8192
-    gpu_memory_size: 10GB
-  qwen3-vl-4b:
-    repo: "Qwen/Qwen3-VL-8B-Instruct"
-    max_model_len: 8192
-    gpu_memory_size: 24GB

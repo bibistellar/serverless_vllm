@@ -1,0 +1,13 @@
+# 模型配置
+models:
+  qwen-vl-2b:
+    name: "Qwen/Qwen3-VL-2B-Instruct"
+    max_model_len: 8192
+    gpu_memory_utilization: 0.9
+    tensor_parallel_size: 1
+  
+  qwen-vl-4b:
+    name: "Qwen/Qwen3-VL-4B-Instruct"
+    max_model_len: 8192
+    gpu_memory_utilization: 0.9
+    tensor_parallel_size: 1
