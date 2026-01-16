@@ -222,6 +222,33 @@ serve.start(
 ### Worker 配置
 Worker 保持原有的 HTTP 服务架构，通过环境变量或命令行参数配置。
 
+**基本配置:**
+- `WORKER_ID`: Worker 唯一标识
+- `WORKER_HOST`: 监听地址（默认 0.0.0.0）
+- `WORKER_PORT`: 监听端口（默认 7000）
+- `MANAGER_URL`: Manager 地址（通过 Router，如 http://localhost:8000）
+
+**端口转发配置（云平台部署）:**
+- `PUBLIC_URL`: Worker 的公网访问地址（可选）
+
+示例：
+```bash
+# 基本配置
+export WORKER_ID="worker-1"
+export WORKER_PORT="7000"
+export MANAGER_URL="http://localhost:8000"
+python -m src.worker.service
+
+# 配置端口转发（云平台）
+export WORKER_ID="worker-1"
+export WORKER_PORT="6006"
+export MANAGER_URL="http://localhost:8000"
+export PUBLIC_URL="https://u557149-9507-6992150f.bjb2.seetacloud.com:8443"
+python -m src.worker.service
+```
+
+详细的端口转发配置请参考：[docs/PORT_FORWARDING.md](docs/PORT_FORWARDING.md)
+
 ## 故障恢复
 
 ### Manager 重启

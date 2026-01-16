@@ -48,13 +48,15 @@ class WorkerService:
         listen_host: str = "0.0.0.0",
         listen_port: int = 7000,
         manager_url: Optional[str] = None,
-        heartbeat_interval: int = 30
+        heartbeat_interval: int = 30,
+        public_url: Optional[str] = None
     ):
         self.worker_id = worker_id
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.manager_url = manager_url
         self.heartbeat_interval = heartbeat_interval
+        self.public_url = public_url  # 公网访问 URL
         
         # vLLM 实例管理器
         self.vllm_manager = VLLMManager()
@@ -325,17 +327,25 @@ class WorkerService:
         
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
+                payload = {
+                    "worker_id": self.worker_id,
+                    "worker_url": f"http://{self.listen_host}:{self.listen_port}",
+                    "gpu_info": self.gpu_info.to_dict()
+                }
+                
+                # 如果配置了公网URL，则添加到请求中
+                if self.public_url:
+                    payload["public_worker_url"] = self.public_url
+                
                 response = await client.post(
                     register_url,
-                    json={
-                        "worker_id": self.worker_id,
-                        "worker_url": f"http://{self.listen_host}:{self.listen_port}",
-                        "gpu_info": self.gpu_info.to_dict()
-                    }
+                    json=payload
                 )
                 
                 if response.status_code == 200:
                     logger.info(f"Successfully registered to manager: {self.manager_url}")
+                    if self.public_url:
+                        logger.info(f"Public URL: {self.public_url}")
                 else:
                     logger.error(f"Failed to register to manager: {response.status_code} - {response.text}")
                     
@@ -459,12 +469,14 @@ def main():
     listen_host = os.getenv("WORKER_HOST", "0.0.0.0")
     listen_port = int(os.getenv("WORKER_PORT", "7000"))
     manager_url = os.getenv("MANAGER_URL")  # 如 http://manager:9000
+    public_url = os.getenv("PUBLIC_URL")  # 如 https://u557149-9507-6992150f.bjb2.seetacloud.com:8443
     
     service = WorkerService(
         worker_id=worker_id,
         listen_host=listen_host,
         listen_port=listen_port,
-        manager_url=manager_url
+        manager_url=manager_url,
+        public_url=public_url
     )
     
     # 运行服务（cleanup 会在 FastAPI 的 shutdown 事件中自动调用）

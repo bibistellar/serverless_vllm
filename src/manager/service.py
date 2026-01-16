@@ -66,14 +66,16 @@ class ManagerService:
         self,
         worker_id: str,
         worker_url: str,
-        gpu_info: Dict
+        gpu_info: Dict,
+        public_worker_url: Optional[str] = None
     ) -> Dict:
         """注册 Worker
         
         Args:
             worker_id: Worker ID
-            worker_url: Worker HTTP 地址
+            worker_url: Worker HTTP 地址（内网）
             gpu_info: GPU 信息字典
+            public_worker_url: Worker 公网访问地址（可选）
             
         Returns:
             注册结果
@@ -100,17 +102,23 @@ class ManagerService:
             worker.gpu_info = gpu_info_obj
             worker.last_heartbeat = time.time()
             worker.status = WorkerStatus.ACTIVE
+            worker.public_worker_url = public_worker_url
             logger.info(f"Worker {worker_id} re-registered")
+            if public_worker_url:
+                logger.info(f"  Public URL: {public_worker_url}")
         else:
             worker = WorkerInfo(
                 worker_id=worker_id,
                 worker_url=worker_url,
                 gpu_info=gpu_info_obj,
                 last_heartbeat=time.time(),
-                status=WorkerStatus.ACTIVE
+                status=WorkerStatus.ACTIVE,
+                public_worker_url=public_worker_url
             )
             self.workers[worker_id] = worker
             logger.info(f"Worker {worker_id} registered: {worker_url}")
+            if public_worker_url:
+                logger.info(f"  Public URL: {public_worker_url}")
         
         return {
             "status": "success",
@@ -286,18 +294,21 @@ class ManagerService:
                 tensor_parallel_size=tensor_parallel_size
             )
             
-            # 创建路由
+            # 创建路由 - 优先使用 public_worker_url
+            routing_url = worker.public_worker_url if worker.public_worker_url else worker.worker_url
+            
             routing = ModelRouting(
                 alias=alias,
                 model_name=model_name,
                 worker_id=worker.worker_id,
-                worker_url=worker.worker_url,
+                worker_url=routing_url,
                 vllm_port=instance_info.get("port"),
                 created_at=time.time()
             )
             self.model_routes[alias] = routing
             
             logger.info(f"Model {alias} registered on worker {worker.worker_id}")
+            logger.info(f"  Routing URL: {routing_url}")
             
             return {
                 "status": "success",
@@ -408,6 +419,7 @@ class ManagerService:
         """在 Worker 上启动 vLLM 实例
         
         注意：模型加载可能需要较长时间（几分钟到十几分钟），所以使用较长的超时
+        使用内网 worker_url 进行管理操作
         """
         url = f"{worker.worker_url}/instances/start"
         

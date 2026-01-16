@@ -15,6 +15,11 @@ export WORKER_ID="${WORKER_ID:-worker-1}"
 export WORKER_HOST="${WORKER_HOST:-0.0.0.0}"
 export WORKER_PORT="${WORKER_PORT:-7000}"
 export MANAGER_URL="${MANAGER_URL:-http://localhost:9000}"
+export PUBLIC_URL="${PUBLIC_URL:-}"
+
+if [ -n "$PUBLIC_URL" ]; then
+    echo "Worker Public URL: $PUBLIC_URL"
+fi
 
 python -m src.worker.service &
 WORKER_PID=$!

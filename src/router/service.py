@@ -275,7 +275,8 @@ class RouterService:
                 result = await manager.register_worker.remote(
                     worker_id=body.get("worker_id"),
                     worker_url=body.get("worker_url"),
-                    gpu_info=body.get("gpu_info", {})
+                    gpu_info=body.get("gpu_info", {}),
+                    public_worker_url=body.get("public_worker_url")
                 )
                 return result
             except Exception as e:

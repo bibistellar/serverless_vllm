@@ -73,6 +73,7 @@ class WorkerInfo:
     last_heartbeat: float
     status: WorkerStatus = WorkerStatus.ACTIVE
     instances: Dict[str, VLLMInstanceInfo] = field(default_factory=dict)
+    public_worker_url: Optional[str] = None  # Worker 的公网访问 URL
     
     def to_dict(self) -> Dict:
         return {
@@ -81,7 +82,8 @@ class WorkerInfo:
             "gpu_info": self.gpu_info.to_dict(),
             "last_heartbeat": self.last_heartbeat,
             "status": self.status.value,
-            "instances": {k: v.to_dict() for k, v in self.instances.items()}
+            "instances": {k: v.to_dict() for k, v in self.instances.items()},
+            "public_worker_url": self.public_worker_url
         }
 
 
