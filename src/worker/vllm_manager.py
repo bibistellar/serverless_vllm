@@ -10,6 +10,7 @@ from typing import Dict, Optional, AsyncIterator
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
+from vllm.inputs.data import TextPrompt
 from src.common.models import VLLMInstanceInfo, InstanceStatus
 
 logger = logging.getLogger(__name__)
@@ -129,18 +130,20 @@ class VLLMManager:
         # 生成唯一的请求 ID
         request_id = f"{alias}-{time.time()}"
         
-        # 调用引擎生成（AsyncLLMEngine.generate 返回异步生成器）
-        # 如果有多模态数据，需要传递给引擎
+        # 构建输入：使用TextPrompt数据结构
         if multi_modal_data:
-            async for output in engine.generate(
-                {"prompt": prompt, "multi_modal_data": multi_modal_data},
-                sampling_params,
-                request_id
-            ):
-                yield output
+            # 多模态输入：使用TextPrompt
+            inputs = TextPrompt(
+                prompt=prompt,
+                multi_modal_data=multi_modal_data
+            )
         else:
-            async for output in engine.generate(prompt, sampling_params, request_id):
-                yield output
+            # 纯文本输入：可以直接使用字符串
+            inputs = prompt
+        
+        # 调用引擎生成（AsyncLLMEngine.generate 返回异步生成器）
+        async for output in engine.generate(inputs, sampling_params, request_id):
+            yield output
     
     async def get_tokenizer(self, alias: str):
         """获取指定引擎的tokenizer
