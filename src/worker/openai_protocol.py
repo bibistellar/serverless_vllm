@@ -4,9 +4,16 @@
 """
 import time
 import uuid
-from typing import Dict, List, Optional, AsyncIterator
+import base64
+import io
+import logging
+from typing import Dict, List, Optional, AsyncIterator, Union
 from pydantic import BaseModel
 from vllm.sampling_params import SamplingParams
+from PIL import Image
+import httpx
+
+logger = logging.getLogger(__name__)
 
 
 # OpenAI API 请求/响应模型
@@ -127,6 +134,70 @@ def format_chat_completion_chunk(
     
     return f"data: {json.dumps(chunk)}\n\n"
 
+async def load_image_from_url(image_url: str) -> Image.Image:
+    """从URL或base64加载图片
+    
+    Args:
+        image_url: 图片URL或base64字符串
+        
+    Returns:
+        PIL.Image对象
+    """
+    if image_url.startswith('data:image'):
+        # Base64编码的图片
+        # 格式: data:image/jpeg;base64,/9j/4AAQ...
+        header, encoded = image_url.split(',', 1)
+        image_data = base64.b64decode(encoded)
+        return Image.open(io.BytesIO(image_data))
+    else:
+        # HTTP(S) URL
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(image_url)
+            response.raise_for_status()
+            return Image.open(io.BytesIO(response.content))
+
+
+async def process_multimodal_content(content: Union[str, List[Dict]]) -> tuple[str, Optional[List[Image.Image]]]:
+    """处理多模态content，提取文本和图片
+    
+    Args:
+        content: 字符串或包含text和image_url的字典列表
+        
+    Returns:
+        (text, images) 元组
+    """
+    if isinstance(content, str):
+        return content, None
+    
+    # 处理列表格式的多模态content
+    text_parts = []
+    images = []
+    
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+            
+        item_type = item.get('type')
+        
+        if item_type == 'text':
+            text_parts.append(item.get('text', ''))
+        elif item_type == 'image_url':
+            image_url_data = item.get('image_url', {})
+            if isinstance(image_url_data, dict):
+                url = image_url_data.get('url')
+            else:
+                url = image_url_data
+                
+            if url:
+                try:
+                    image = await load_image_from_url(url)
+                    images.append(image)
+                except Exception as e:
+                    logger.error(f"Failed to load image from {url}: {e}")
+                    raise ValueError(f"Failed to load image: {e}")
+    
+    text = ' '.join(text_parts) if text_parts else ''
+    return text, images if images else None
 
 def format_completion_response(
     request_id: str,
@@ -157,13 +228,13 @@ def format_completion_response(
     }
 
 
-def messages_to_prompt(
+async def messages_to_prompt_and_images(
     messages: List[ChatMessage],
     tokenizer=None,
     add_generation_prompt: bool = True,
     continue_final_message: bool = False
-) -> str:
-    """将 messages 转换为单个 prompt 字符串
+) -> tuple[str, Optional[List[Image.Image]]]:
+    """将 messages 转换为 prompt 字符串和图片列表
     
     参考 vLLM 的实现，优先使用 tokenizer 的 chat_template
     
@@ -174,24 +245,30 @@ def messages_to_prompt(
         continue_final_message: 是否继续最后一条消息（默认False）
     
     Returns:
-        格式化后的 prompt
+        (prompt, images) 元组
     """
-    # 转换为字典格式（支持多模态content）
+    # 处理多模态content，提取文本和图片
+    all_images = []
     conversation = []
+    
     for msg in messages:
         message_dict = {"role": msg.role}
-        # 如果content是字符串，直接使用；如果是列表，保持原样
+        
+        # 处理content（可能是文本或多模态列表）
         if isinstance(msg.content, str):
             message_dict["content"] = msg.content
         else:
-            # 多模态content，保持列表格式
-            message_dict["content"] = msg.content
+            # 多模态content
+            text, images = await process_multimodal_content(msg.content)
+            message_dict["content"] = text
+            if images:
+                all_images.extend(images)
+        
         conversation.append(message_dict)
     
     # 如果有 tokenizer 且支持 chat_template，使用它
     if tokenizer is not None:
         try:
-            # 尝试使用 tokenizer 的 apply_chat_template
             if hasattr(tokenizer, 'apply_chat_template'):
                 prompt = tokenizer.apply_chat_template(
                     conversation,
@@ -199,11 +276,8 @@ def messages_to_prompt(
                     add_generation_prompt=add_generation_prompt,
                     continue_final_message=continue_final_message
                 )
-                return prompt
+                return prompt, all_images if all_images else None
         except Exception as e:
-            # 如果失败，记录警告并使用默认方法
-            import logging
-            logger = logging.getLogger(__name__)
             logger.warning(f"Failed to apply chat template: {e}, using fallback")
     
     # 默认方法：使用通用的 ChatML 格式（适用于 Qwen 等模型）
@@ -213,14 +287,6 @@ def messages_to_prompt(
         role = msg["role"]
         content = msg["content"]
         
-        # 如果content是列表（多模态），只提取文本部分
-        if isinstance(content, list):
-            text_parts = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text_parts.append(item.get("text", ""))
-            content = " ".join(text_parts)
-        
         if role == "system":
             prompt_parts.append(f"<|im_start|>system\n{content}<|im_end|>")
         elif role == "user":
@@ -229,6 +295,64 @@ def messages_to_prompt(
             prompt_parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
     
     # 根据参数决定是否添加 assistant 开始标记
+    if add_generation_prompt and not continue_final_message:
+        prompt_parts.append("<|im_start|>assistant\n")
+    
+    prompt = "\n".join(prompt_parts)
+    return prompt, all_images if all_images else None
+
+
+def messages_to_prompt(
+    messages: List[ChatMessage],
+    tokenizer=None,
+    add_generation_prompt: bool = True,
+    continue_final_message: bool = False
+) -> str:
+    """同步版本的messages_to_prompt（不支持图片）
+    
+    为了向后兼容保留此函数
+    """
+    # 转换为字典格式（只处理文本）
+    conversation = []
+    for msg in messages:
+        message_dict = {"role": msg.role}
+        if isinstance(msg.content, str):
+            message_dict["content"] = msg.content
+        else:
+            # 多模态content，只提取文本部分
+            text_parts = []
+            for item in msg.content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+            message_dict["content"] = " ".join(text_parts)
+        conversation.append(message_dict)
+    
+    # 如果有 tokenizer 且支持 chat_template，使用它
+    if tokenizer is not None:
+        try:
+            if hasattr(tokenizer, 'apply_chat_template'):
+                prompt = tokenizer.apply_chat_template(
+                    conversation,
+                    tokenize=False,
+                    add_generation_prompt=add_generation_prompt,
+                    continue_final_message=continue_final_message
+                )
+                return prompt
+        except Exception as e:
+            logger.warning(f"Failed to apply chat template: {e}, using fallback")
+    
+    # 默认方法：使用通用的 ChatML 格式
+    prompt_parts = []
+    for msg in conversation:
+        role = msg["role"]
+        content = msg["content"]
+        if role == "system":
+            prompt_parts.append(f"<|im_start|>system\n{content}<|im_end|>")
+        elif role == "user":
+            prompt_parts.append(f"<|im_start|>user\n{content}<|im_end|>")
+        elif role == "assistant":
+            prompt_parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
+    
     if add_generation_prompt and not continue_final_message:
         prompt_parts.append("<|im_start|>assistant\n")
     

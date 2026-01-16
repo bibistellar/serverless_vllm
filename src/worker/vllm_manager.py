@@ -104,7 +104,8 @@ class VLLMManager:
         self,
         alias: str,
         prompt: str,
-        sampling_params: SamplingParams
+        sampling_params: SamplingParams,
+        multi_modal_data: Optional[Dict] = None
     ) -> AsyncIterator:
         """使用指定引擎进行生成（异步生成器）
         
@@ -112,6 +113,7 @@ class VLLMManager:
             alias: 实例别名
             prompt: 输入文本（已经应用chat template）
             sampling_params: 采样参数
+            multi_modal_data: 多模态数据（如图片），格式为 {"image": [PIL.Image, ...]}
             
         Yields:
             生成结果
@@ -128,8 +130,17 @@ class VLLMManager:
         request_id = f"{alias}-{time.time()}"
         
         # 调用引擎生成（AsyncLLMEngine.generate 返回异步生成器）
-        async for output in engine.generate(prompt, sampling_params, request_id):
-            yield output
+        # 如果有多模态数据，需要传递给引擎
+        if multi_modal_data:
+            async for output in engine.generate(
+                {"prompt": prompt, "multi_modal_data": multi_modal_data},
+                sampling_params,
+                request_id
+            ):
+                yield output
+        else:
+            async for output in engine.generate(prompt, sampling_params, request_id):
+                yield output
     
     def get_tokenizer(self, alias: str):
         """获取指定引擎的tokenizer"""

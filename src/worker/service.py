@@ -29,6 +29,7 @@ from src.worker.openai_protocol import (
     format_chat_completion_response,
     format_completion_response,
     messages_to_prompt,
+    messages_to_prompt_and_images,
     stream_chat_completion
 )
 
@@ -208,19 +209,21 @@ class WorkerService:
                     detail=f"Instance {alias} is not running (status: {instance.status.value})"
                 )
             
-            # 获取 tokenizer 并转换 messages 为 prompt
+            # 获取 tokenizer 并转换 messages 为 prompt（支持图片）
             try:
                 tokenizer = self.vllm_manager.get_tokenizer(alias)
-                prompt = messages_to_prompt(
+                prompt, images = await messages_to_prompt_and_images(
                     request.messages,
                     tokenizer,
                     add_generation_prompt=request.add_generation_prompt,
                     continue_final_message=request.continue_final_message
                 )
                 logger.debug(f"Generated prompt for {alias}: {prompt[:100]}...")
+                if images:
+                    logger.info(f"Loaded {len(images)} image(s) for {alias}")
             except Exception as e:
                 logger.warning(f"Failed to get tokenizer for {alias}: {e}, using fallback")
-                prompt = messages_to_prompt(
+                prompt, images = await messages_to_prompt_and_images(
                     request.messages,
                     None,
                     add_generation_prompt=request.add_generation_prompt,
@@ -241,10 +244,17 @@ class WorkerService:
             import uuid
             request_id = str(uuid.uuid4())
             
+            # 构建多模态数据
+            multi_modal_data = None
+            if images:
+                multi_modal_data = {"image": images}
+            
             try:
                 if request.stream:
                     # 流式响应
-                    engine_output = self.vllm_manager.generate(alias, prompt, sampling_params)
+                    engine_output = self.vllm_manager.generate(
+                        alias, prompt, sampling_params, multi_modal_data
+                    )
                     return StreamingResponse(
                         stream_chat_completion(engine_output, request_id, request.model),
                         media_type="text/event-stream"
@@ -254,7 +264,9 @@ class WorkerService:
                     full_text = ""
                     finish_reason = "stop"
                     
-                    async for output in self.vllm_manager.generate(alias, prompt, sampling_params):
+                    async for output in self.vllm_manager.generate(
+                        alias, prompt, sampling_params, multi_modal_data
+                    ):
                         for completion_output in output.outputs:
                             full_text = completion_output.text
                             if completion_output.finish_reason:
