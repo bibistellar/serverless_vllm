@@ -1,0 +1,13 @@
+/root/Code/video_anomaly_system/.venv/lib/python3.10/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+INFO 01-16 20:19:38 [__init__.py:216] Automatically detected platform cuda.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+============================================================
+测试 Qwen2-VL-2B-Instruct 多模态功能
+============================================================
+
+[1/6] 创建引擎...
+INFO 01-16 20:19:53 [model.py:547] Resolved architecture: Qwen2VLForConditionalGeneration
+`torch_dtype` is deprecated! Use `dtype` instead!
+INFO 01-16 20:19:53 [model.py:1510] Using max model len 4096
+INFO 01-16 20:19:54 [scheduler.py:205] Chunked prefill is enabled with max_num_batched_tokens=5120.

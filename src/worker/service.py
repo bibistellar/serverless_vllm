@@ -6,6 +6,8 @@
 3. 接收并路由推理请求到对应的 vLLM 实例
 4. 向中央 Manager 注册并定期发送心跳
 5. 提供动态路由，根据 alias 转发请求到对应的 vLLM server
+
+专门针对 Qwen3-VL 多模态模型优化
 """
 import asyncio
 import logging
@@ -28,8 +30,6 @@ from src.worker.openai_protocol import (
     convert_to_sampling_params,
     format_chat_completion_response,
     format_completion_response,
-    messages_to_prompt,
-    messages_to_prompt_and_images,
     stream_chat_completion
 )
 
@@ -185,7 +185,7 @@ class WorkerService:
         
         @self.app.post("/proxy/{alias}/v1/chat/completions")
         async def chat_completions(alias: str, request: ChatCompletionRequest):
-            """OpenAI Chat Completions API - 直接调用 vLLM 引擎"""
+            """OpenAI Chat Completions API - Qwen3-VL 优化版本"""
             instance = self.vllm_manager.get_instance(alias)
             if not instance:
                 raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
@@ -209,26 +209,15 @@ class WorkerService:
                     detail=f"Instance {alias} is not running (status: {instance.status.value})"
                 )
             
-            # 获取 tokenizer 并转换 messages 为 prompt（支持图片）
+            # 转换 OpenAI 格式的消息为 Qwen3-VL 格式
+            from src.worker.openai_protocol import process_messages_to_qwen_format
+            
             try:
-                tokenizer = await self.vllm_manager.get_tokenizer(alias)
-                prompt, images = await messages_to_prompt_and_images(
-                    request.messages,
-                    tokenizer,
-                    add_generation_prompt=request.add_generation_prompt,
-                    continue_final_message=request.continue_final_message
-                )
-                logger.debug(f"Generated prompt for {alias}: {prompt[:100]}...")
-                if images:
-                    logger.info(f"Loaded {len(images)} image(s) for {alias}")
+                qwen_messages = await process_messages_to_qwen_format(request.messages)
+                logger.debug(f"Converted {len(qwen_messages)} messages for {alias}")
             except Exception as e:
-                logger.warning(f"Failed to get tokenizer for {alias}: {e}, using fallback")
-                prompt, images = await messages_to_prompt_and_images(
-                    request.messages,
-                    None,
-                    add_generation_prompt=request.add_generation_prompt,
-                    continue_final_message=request.continue_final_message
-                )
+                logger.error(f"Failed to convert messages: {e}")
+                raise HTTPException(status_code=400, detail=f"Invalid message format: {e}")
             
             # 构建采样参数
             sampling_params = convert_to_sampling_params(
@@ -244,16 +233,11 @@ class WorkerService:
             import uuid
             request_id = str(uuid.uuid4())
             
-            # 构建多模态数据
-            multi_modal_data = None
-            if images:
-                multi_modal_data = {"image": images}
-            
             try:
                 if request.stream:
                     # 流式响应
                     engine_output = self.vllm_manager.generate(
-                        alias, prompt, sampling_params, multi_modal_data
+                        alias, qwen_messages, sampling_params
                     )
                     return StreamingResponse(
                         stream_chat_completion(engine_output, request_id, request.model),
@@ -265,7 +249,7 @@ class WorkerService:
                     finish_reason = "stop"
                     
                     async for output in self.vllm_manager.generate(
-                        alias, prompt, sampling_params, multi_modal_data
+                        alias, qwen_messages, sampling_params
                     ):
                         for completion_output in output.outputs:
                             full_text = completion_output.text
@@ -287,7 +271,7 @@ class WorkerService:
         
         @self.app.post("/proxy/{alias}/v1/completions")
         async def completions(alias: str, request: CompletionRequest):
-            """OpenAI Completions API - 直接调用 vLLM 引擎"""
+            """OpenAI Completions API - 简化版本（不推荐使用，请使用 Chat Completions）"""
             instance = self.vllm_manager.get_instance(alias)
             if not instance:
                 raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
@@ -311,6 +295,9 @@ class WorkerService:
                     detail=f"Instance {alias} is not running"
                 )
             
+            # 将 prompt 转换为消息格式
+            messages = [{"role": "user", "content": request.prompt}]
+            
             # 构建采样参数
             sampling_params = convert_to_sampling_params(
                 temperature=request.temperature,
@@ -324,11 +311,11 @@ class WorkerService:
             request_id = str(uuid.uuid4())
             
             try:
-                # 非流式响应（简化实现）
+                # 使用统一的 generate 方法
                 full_text = ""
                 finish_reason = "stop"
                 
-                async for output in self.vllm_manager.generate(alias, request.prompt, sampling_params):
+                async for output in self.vllm_manager.generate(alias, messages, sampling_params):
                     for completion_output in output.outputs:
                         full_text = completion_output.text
                         if completion_output.finish_reason:
