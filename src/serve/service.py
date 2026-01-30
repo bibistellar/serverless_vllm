@@ -1,6 +1,6 @@
 """Ray Serve Router+Manager Service
 
-将 Router 与 Manager 合并为一个 Ray Serve 服务，并通过内部 Ray Actor
+将 Router 与 Manager 合并为一个 Ray Serve 服务（单一 actor），
 对接外部 Worker 的 vLLM 实例（HTTP 方式）。
 
 默认网络可连通，不做心跳保活逻辑，减少控制面复杂度。
@@ -30,8 +30,7 @@ logging.basicConfig(
 )
 
 
-@ray.remote(max_concurrency=200)
-class WorkerRegistryActor:
+class WorkerRegistryCore:
     """管理外部 Worker 与 vLLM 实例的注册与路由信息。"""
 
     def __init__(
@@ -98,6 +97,7 @@ class WorkerRegistryActor:
         return {"workers": list(self.workers.values())}
 
     async def list_models(self) -> Dict:
+        await self._prune_orphan_instances()
         return {
             "models": [
                 {
@@ -116,6 +116,7 @@ class WorkerRegistryActor:
         return instances[0]
 
     async def select_instance_for_request(self, alias: str) -> Optional[Dict]:
+        await self._prune_orphan_instances()
         return await self.autoscaler.select_instance(self, alias)
 
     def _iter_worker_devices(self, worker: Dict) -> List[Dict]:
@@ -411,12 +412,31 @@ class WorkerRegistryActor:
         return {"status": "success", "message": f"Model {alias} unregistered"}
 
     async def health(self) -> Dict:
+        await self._prune_orphan_instances()
         return {
             "status": "ok",
             "service": "serve",
             "workers": len(self.workers),
             "models": len(self.model_instances),
         }
+
+    async def _prune_orphan_instances(self) -> None:
+        async with self._lock:
+            if not self.model_instances:
+                return
+            worker_ids = set(self.workers.keys())
+            aliases_to_remove = []
+            for alias, instances in list(self.model_instances.items()):
+                kept = [inst for inst in instances if inst.get("worker_id") in worker_ids]
+                if kept:
+                    if len(kept) != len(instances):
+                        self.model_instances[alias] = kept
+                else:
+                    aliases_to_remove.append(alias)
+            for alias in aliases_to_remove:
+                self.model_instances.pop(alias, None)
+                self.model_configs.pop(alias, None)
+                self._replica_counters.pop(alias, None)
 
     def _unregister_worker_locked(self, worker_id: str) -> Dict:
         if worker_id not in self.workers:
@@ -435,6 +455,8 @@ class WorkerRegistryActor:
                 self.model_instances[alias] = instances
             else:
                 self.model_instances.pop(alias, None)
+                self.model_configs.pop(alias, None)
+                self._replica_counters.pop(alias, None)
 
         self.workers.pop(worker_id, None)
         self.failure_counts.pop(worker_id, None)
@@ -506,14 +528,35 @@ _MAX_ONGOING = int(os.getenv("SERVE_MAX_ONGOING_REQUESTS", "100"))
 
 @serve.deployment(max_ongoing_requests=_MAX_ONGOING)
 @serve.ingress(fastapi_app)
-class RouterManagerServe:
-    def __init__(self, registry_handle):
-        self.registry = registry_handle
+class RouterManagerServe(WorkerRegistryCore):
+    def __init__(
+        self,
+        healthcheck_interval: float = 15.0,
+        healthcheck_timeout: float = 3.0,
+        max_failures: int = 3,
+        load_high: float = 0.7,
+        load_low: float = 0.3,
+        instance_capacity: int = 4,
+        min_replicas: int = 1,
+        max_replicas: int = 8,
+        scale_interval: float = 10.0,
+    ):
+        super().__init__(
+            healthcheck_interval=healthcheck_interval,
+            healthcheck_timeout=healthcheck_timeout,
+            max_failures=max_failures,
+            load_high=load_high,
+            load_low=load_low,
+            instance_capacity=instance_capacity,
+            min_replicas=min_replicas,
+            max_replicas=max_replicas,
+            scale_interval=scale_interval,
+        )
         self.request_timeout = float(os.getenv("ROUTER_REQUEST_TIMEOUT", "300"))
 
     @fastapi_app.get("/health")
-    async def health(self):
-        return await self.registry.health.remote()
+    async def http_health(self):
+        return await self.health()
 
     @fastapi_app.post("/v1/chat/completions")
     async def chat_completions(self, request: Request):
@@ -522,7 +565,7 @@ class RouterManagerServe:
         if not model:
             raise HTTPException(status_code=400, detail="model is required")
 
-        routing = await self.registry.select_instance_for_request.remote(model)
+        routing = await self.select_instance_for_request(model)
         if not routing:
             raise HTTPException(status_code=404, detail=f"Model {model} not found")
 
@@ -592,7 +635,7 @@ class RouterManagerServe:
         if not model:
             raise HTTPException(status_code=400, detail="model is required")
 
-        routing = await self.registry.select_instance_for_request.remote(model)
+        routing = await self.select_instance_for_request(model)
         if not routing:
             raise HTTPException(status_code=404, detail=f"Model {model} not found")
 
@@ -616,8 +659,8 @@ class RouterManagerServe:
                 raise HTTPException(status_code=502, detail=f"Error forwarding request: {exc}")
 
     @fastapi_app.get("/v1/models")
-    async def list_models(self):
-        result = await self.registry.list_models.remote()
+    async def openai_list_models(self):
+        result = await self.list_models()
         routes = result.get("models", [])
         data = []
         for route in routes:
@@ -641,7 +684,7 @@ class RouterManagerServe:
     @fastapi_app.post("/admin/models/register")
     async def admin_register_model(self, request: Request):
         body = await request.json()
-        return await self.registry.register_model.remote(
+        return await self.register_model(
             alias=body.get("alias"),
             model_name=body.get("model_name"),
             model_path=body.get("model_path"),
@@ -658,32 +701,32 @@ class RouterManagerServe:
 
     @fastapi_app.delete("/admin/models/{alias}")
     async def admin_unregister_model(self, alias: str):
-        return await self.registry.unregister_model.remote(alias)
+        return await self.unregister_model(alias)
 
     @fastapi_app.get("/admin/models")
     async def admin_list_models(self):
-        return await self.registry.list_models.remote()
+        return await self.list_models()
 
     @fastapi_app.get("/admin/workers")
     async def admin_list_workers(self):
-        return await self.registry.list_workers.remote()
+        return await self.list_workers()
 
     @fastapi_app.get("/admin/status")
     async def admin_status(self):
         return {
-            "health": await self.registry.health.remote(),
-            "models": await self.registry.list_models.remote(),
-            "workers": await self.registry.list_workers.remote(),
+            "health": await self.health(),
+            "models": await self.list_models(),
+            "workers": await self.list_workers(),
         }
 
     @fastapi_app.get("/workers")
-    async def list_workers(self):
-        return await self.registry.list_workers.remote()
+    async def public_list_workers(self):
+        return await self.list_workers()
 
     @fastapi_app.post("/workers/register")
-    async def register_worker(self, request: Request):
+    async def http_register_worker(self, request: Request):
         body = await request.json()
-        return await self.registry.register_worker.remote(
+        return await self.register_worker(
             worker_id=body.get("worker_id"),
             worker_url=body.get("worker_url"),
             public_worker_url=body.get("public_worker_url"),
@@ -691,8 +734,8 @@ class RouterManagerServe:
         )
 
     @fastapi_app.delete("/workers/{worker_id}/unregister")
-    async def unregister_worker(self, worker_id: str):
-        return await self.registry.unregister_worker.remote(worker_id)
+    async def http_unregister_worker(self, worker_id: str):
+        return await self.unregister_worker(worker_id)
 
 
 def _init_ray():
@@ -735,10 +778,8 @@ def main():
     max_replicas = int(os.getenv("MODEL_MAX_REPLICAS", "8"))
     scale_interval = float(os.getenv("MODEL_SCALE_INTERVAL", "10"))
 
-    try:
-        registry = ray.get_actor("worker_registry")
-    except ValueError:
-        registry = WorkerRegistryActor.options(name="worker_registry", lifetime="detached").remote(
+    serve.run(
+        RouterManagerServe.bind(
             healthcheck_interval=healthcheck_interval,
             healthcheck_timeout=healthcheck_timeout,
             max_failures=max_failures,
@@ -748,8 +789,9 @@ def main():
             min_replicas=min_replicas,
             max_replicas=max_replicas,
             scale_interval=scale_interval,
-        )
-    serve.run(RouterManagerServe.bind(registry), route_prefix="/")
+        ),
+        route_prefix="/",
+    )
 
     logger.info("Ray Serve running on %s:%s", serve_host, serve_port)
 

@@ -234,43 +234,43 @@ class VLLMManager:
         }
         
         try:
-            # 加载 AutoProcessor (用于 Qwen3-VL 多模态处理)
-            logger.info(f"Loading AutoProcessor for '{alias}'...")
-            processor = AutoProcessor.from_pretrained(
-                model_path,
-                trust_remote_code=True
-            )
-            self.processors[alias] = processor
-            logger.info(f"✅ AutoProcessor loaded for '{alias}'")
-            
-            # 构建引擎参数（针对 Qwen3-VL 优化）
-            engine_args = AsyncEngineArgs(
-                model=model_path,
-                mm_encoder_tp_mode="data",  # Qwen3-VL 推荐设置
-                enable_expert_parallel=False,
-                tensor_parallel_size=tensor_parallel_size,
-                gpu_memory_utilization=gpu_memory_utilization,
-                max_model_len=max_model_len,
-                seed=0,
-                trust_remote_code=True,
-            )
-            
-            logger.info(f"Creating AsyncLLMEngine for '{alias}'...")
+            def _build_engine_sync():
+                logger.info(f"Loading AutoProcessor for '{alias}'...")
+                processor = AutoProcessor.from_pretrained(
+                    model_path,
+                    trust_remote_code=True,
+                )
+                logger.info(f"✅ AutoProcessor loaded for '{alias}'")
+
+                engine_args = AsyncEngineArgs(
+                    model=model_path,
+                    mm_encoder_tp_mode="data",  # Qwen3-VL 推荐设置
+                    enable_expert_parallel=False,
+                    tensor_parallel_size=tensor_parallel_size,
+                    gpu_memory_utilization=gpu_memory_utilization,
+                    max_model_len=max_model_len,
+                    seed=0,
+                    trust_remote_code=True,
+                )
+
+                logger.info(f"Creating AsyncLLMEngine for '{alias}'...")
+                engine = AsyncLLMEngine.from_engine_args(engine_args)
+                return processor, engine, engine_args
+
             start_time = time.time()
-            
-            # 创建引擎（这是一个异步操作，可能需要较长时间）
-            engine = AsyncLLMEngine.from_engine_args(engine_args)
-            
+            processor, engine, engine_args = await asyncio.to_thread(_build_engine_sync)
+
+            self.processors[alias] = processor
             self.engines[alias] = engine
             self.engine_args[alias] = engine_args  # 保存引擎参数供重新加载使用
             self.sleep_levels[alias] = SleepLevel.ACTIVE  # 初始为激活状态
             instance.status = InstanceStatus.RUNNING
-            
+
             elapsed = time.time() - start_time
             logger.info(f"✅ vLLM engine '{alias}' is READY! (took {elapsed:.1f}s)")
-            
+
             return instance
-            
+
         except Exception as e:
             logger.error(f"❌ Failed to start vLLM engine '{alias}': {e}")
             instance.status = InstanceStatus.ERROR

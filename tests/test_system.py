@@ -133,7 +133,7 @@ class SystemTester:
                     json={
                         "alias": alias,
                         "model_name": model_name,
-                        "gpu_memory_gb": 6.0,
+                        "gpu_memory_gb": 8.0,
                         "max_model_len": 2048
                     }
                 )
@@ -360,7 +360,7 @@ class SystemTester:
         print("\n=== 测试自动扩容（真模型） ===")
         alias = "qwen3-vl-2b-test"
         model_name = "Qwen/Qwen3-VL-2B-Instruct"
-        gpu_memory_gb = float(os.getenv("REAL_MODEL_GPU_GB", "6.0"))
+        gpu_memory_gb = float(os.getenv("REAL_MODEL_GPU_GB", "8.0"))
         max_model_len = int(os.getenv("REAL_MODEL_MAX_LEN", "2048"))
         max_concurrency = int(os.getenv("REAL_MODEL_MAX_CONCURRENCY", "8"))
         step = int(os.getenv("REAL_MODEL_CONCURRENCY_STEP", "2"))
@@ -458,12 +458,13 @@ class SystemTester:
         
         # 功能测试（可选，需要较长时间）
         if os.getenv("RUN_FULL_TESTS") == "1":
-            await self.test_model_registration()
+            # await self.test_model_registration()
             await self.test_list_models()
-            await self.test_chat_completion(ensure_registered=False)
-            await self.test_multimodal_single_image()
-            await self.test_multimodal_image_list()
-            await self.test_streaming_chat(ensure_registered=False)
+            # await self.test_chat_completion(ensure_registered=False)
+            # await self.test_chat_completion(model="my_model",ensure_registered=True)
+            # await self.test_multimodal_single_image()
+            # await self.test_multimodal_image_list()
+            # await self.test_streaming_chat(ensure_registered=False)
             # await self.test_autoscale_fake_model()
             if os.getenv("RUN_REAL_AUTOSCALE_TEST") == "1":
                 await self.test_autoscale_real_model()

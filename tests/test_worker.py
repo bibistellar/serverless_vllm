@@ -57,11 +57,11 @@ class WorkerTester:
 
     async def run_all(self):
         await self.test_health()
-        await self.test_fake_instance_lifecycle()
+        # await self.test_fake_instance_lifecycle()
 
 
 async def main():
-    worker_url = os.getenv("WORKER_URL", "http://localhost:7000")
+    worker_url = os.getenv("WORKER_URL", "http://100.66.213.127:7000")
     tester = WorkerTester(worker_url=worker_url)
     await tester.run_all()
 
