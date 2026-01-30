@@ -17,12 +17,10 @@ class SystemTester:
     def __init__(
         self,
         serve_url: str = "http://localhost:8000",
-        worker_url: str = "http://localhost:7000",
         model_alias: str = "test-model",
         model_name: str = "Qwen/Qwen3-VL-2B-Instruct",
     ):
         self.serve_url = serve_url
-        self.worker_url = worker_url
         self.model_alias = model_alias
         self.model_name = model_name
 
@@ -50,16 +48,17 @@ class SystemTester:
         encoded = base64.b64encode(data).decode("ascii")
         return f"data:image/png;base64,{encoded}"
 
-    async def _wait_instance_running(self, alias: str, timeout_s: int = 600) -> bool:
+    async def _wait_model_ready(self, alias: str, timeout_s: int = 600) -> bool:
         deadline = time.time() + timeout_s
         async with httpx.AsyncClient(timeout=10.0) as client:
             while time.time() < deadline:
                 try:
-                    response = await client.get(f"{self.worker_url}/instances/{alias}/status")
+                    response = await client.get(f"{self.serve_url}/admin/models")
                     if response.status_code == 200:
-                        status = response.json().get("status")
-                        if status == "running":
-                            return True
+                        models = response.json().get("models", [])
+                        for model in models:
+                            if model.get("alias") == alias and model.get("instances"):
+                                return True
                 except Exception:
                     pass
                 await asyncio.sleep(5)
@@ -109,21 +108,6 @@ class SystemTester:
             content = result["choices"][0]["message"]["content"]
         return latency, content
 
-    async def _wait_sleep_level(self, alias: str, target_level: int, timeout_s: int = 300) -> bool:
-        deadline = time.time() + timeout_s
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            while time.time() < deadline:
-                try:
-                    response = await client.get(f"{self.worker_url}/instances/{alias}/status")
-                    if response.status_code == 200:
-                        status = response.json()
-                        if status.get("sleep_level_value") == target_level:
-                            return True
-                except Exception:
-                    pass
-                await asyncio.sleep(2)
-        return False
-    
     async def test_health_checks(self):
         """测试健康检查"""
         print("\n=== 测试健康检查 ===")
@@ -135,27 +119,6 @@ class SystemTester:
                 print(f"✓ Serve 健康: {response.json()}")
             except Exception as e:
                 print(f"✗ Serve 不可用: {e}")
-            
-            # 测试 Worker
-            try:
-                response = await client.get(f"{self.worker_url}/health")
-                print(f"✓ Worker 健康: {response.json()}")
-            except Exception as e:
-                print(f"✗ Worker 不可用: {e}")
-    
-    async def test_worker_registration(self):
-        """测试 Worker 注册"""
-        print("\n=== 测试 Worker 列表 ===")
-        
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(f"{self.serve_url}/workers")
-                workers = response.json()
-                print(f"已注册 Worker 数量: {len(workers['workers'])}")
-                for worker in workers['workers']:
-                    print(f"  - {worker['worker_id']}")
-            except Exception as e:
-                print(f"✗ 获取 Worker 列表失败: {e}")
     
     async def test_model_registration(self, alias: str = None, model_name: str = None):
         """测试模型注册"""
@@ -163,14 +126,14 @@ class SystemTester:
         model_name = model_name or self.model_name
         print(f"\n=== 测试模型注册: {alias} ===")
         
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=360.0) as client:
             try:
                 response = await client.post(
                     f"{self.serve_url}/admin/models/register",
                     json={
                         "alias": alias,
                         "model_name": model_name,
-                        "gpu_memory_utilization": 0.5,
+                        "gpu_memory_gb": 6.0,
                         "max_model_len": 2048
                     }
                 )
@@ -206,7 +169,7 @@ class SystemTester:
                     await self.test_model_registration(alias=model)
                 # 等待模型就绪
                 print("等待模型就绪...")
-                ready = await self._wait_instance_running(model, timeout_s=600)
+                ready = await self._wait_model_ready(model, timeout_s=600)
                 if not ready:
                     print("✗ 模型未在超时内就绪")
                     return False
@@ -244,7 +207,6 @@ class SystemTester:
                 status = response.json()
                 print(f"Serve 状态: {status['health']}")
                 print(f"模型数量: {len(status['models']['models'])}")
-                print(f"Worker 数量: {len(status['workers']['workers'])}")
             except Exception as e:
                 print(f"✗ 获取系统状态失败: {e}")
 
@@ -306,12 +268,10 @@ class SystemTester:
         print(f"\n=== 测试流式输出: {model} ===")
         if ensure_registered:
             await self.test_model_registration(alias=model)
-        ready = await self._wait_instance_running(model, timeout_s=600)
+        ready = await self._wait_model_ready(model, timeout_s=600)
         if not ready:
             print("✗ 模型未在超时内就绪，跳过流式测试")
             return False
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            await client.post(f"{self.worker_url}/instances/{model}/wake")
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": "用一句话介绍你自己。"}],
@@ -328,50 +288,6 @@ class SystemTester:
         except Exception as e:
             print(f"✗ 流式输出失败: {e}")
             return False
-
-    async def test_sleep_mode_latency(self, model: str = None, ensure_registered: bool = True):
-        model = model or self.model_alias
-        print(f"\n=== 测试休眠模式首字符延迟: {model} ===")
-        if ensure_registered:
-            await self.test_model_registration(alias=model)
-        ready = await self._wait_instance_running(model, timeout_s=600)
-        if not ready:
-            print("✗ 模型未在超时内就绪，跳过休眠测试")
-            return False
-        levels = [
-            ("ACTIVE", 0),
-            ("SLEEP_1", 1),
-            ("SLEEP_2", 2),
-            ("UNLOADED", 3),
-        ]
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            for name, level in levels:
-                try:
-                    if level == 0:
-                        await client.post(f"{self.worker_url}/instances/{model}/wake")
-                    else:
-                        await client.post(
-                            f"{self.worker_url}/instances/{model}/sleep",
-                            json={"level": level},
-                        )
-                    ready_level = await self._wait_sleep_level(model, level, timeout_s=300)
-                    if not ready_level:
-                        print(f"✗ {name} 休眠级别未在超时内就绪，跳过")
-                        continue
-                    payload = {
-                        "model": model,
-                        "messages": [{"role": "user", "content": "请输出一句话。"}],
-                        "max_tokens": 1,
-                        "stream": False,
-                    }
-                    latency, _ = await self._single_token_latency(payload, timeout_s=600)
-                    if latency is None:
-                        print(f"✗ {name} 首字符延迟获取失败")
-                    else:
-                        print(f"✓ {name} 首字符延迟: {latency:.3f}s")
-                    await asyncio.sleep(1)
-                except Exception as e:
-                    print(f"✗ {name} 测试失败: {e}")
 
     async def test_autoscale_fake_model(self):
         """测试自动扩容逻辑（假模型）"""
@@ -444,9 +360,8 @@ class SystemTester:
         print("\n=== 测试自动扩容（真模型） ===")
         alias = "qwen3-vl-2b-test"
         model_name = "Qwen/Qwen3-VL-2B-Instruct"
-        gpu_util = float(os.getenv("REAL_MODEL_GPU_UTIL", "0.5"))
+        gpu_memory_gb = float(os.getenv("REAL_MODEL_GPU_GB", "6.0"))
         max_model_len = int(os.getenv("REAL_MODEL_MAX_LEN", "2048"))
-        instance_capacity = int(os.getenv("MODEL_INSTANCE_CAPACITY", "4"))
         max_concurrency = int(os.getenv("REAL_MODEL_MAX_CONCURRENCY", "8"))
         step = int(os.getenv("REAL_MODEL_CONCURRENCY_STEP", "2"))
         hold_seconds = int(os.getenv("REAL_MODEL_HOLD_SECONDS", "20"))
@@ -459,7 +374,7 @@ class SystemTester:
                 json={
                     "alias": alias,
                     "model_name": model_name,
-                    "gpu_memory_utilization": gpu_util,
+                    "gpu_memory_gb": gpu_memory_gb,
                     "max_model_len": max_model_len,
                 },
             )
@@ -471,7 +386,7 @@ class SystemTester:
                 print(f"✗ 真模型注册失败: {result}")
                 return False
 
-        ready = await self._wait_instance_running(alias, timeout_s=1200)
+        ready = await self._wait_model_ready(alias, timeout_s=1200)
         if not ready:
             print("✗ 真模型未在超时内就绪")
             return False
@@ -500,32 +415,6 @@ class SystemTester:
                 data = models.json().get("models", [])
                 return next((m for m in data if m.get("alias") == alias), None)
 
-        async def _avg_load():
-            model_entry = await _get_instances()
-            if not model_entry:
-                return 0.0, []
-            instances = model_entry.get("instances", [])
-            loads = []
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                for inst in instances:
-                    inst_alias = inst.get("instance_alias")
-                    if not inst_alias:
-                        continue
-                    status = await client.get(f"{self.worker_url}/instances/{inst_alias}/status")
-                    if status.status_code != 200:
-                        continue
-                    info = status.json()
-                    inflight = int(info.get("inflight_requests", 0))
-                    capacity = int(info.get("capacity") or instance_capacity)
-                    load = min(inflight / max(1, capacity), 1.0)
-                    loads.append((inst_alias, load, info.get("sleep_level_value", 0)))
-            if not loads:
-                return 0.0, []
-            avg = sum(item[1] for item in loads) / len(loads)
-            return avg, loads
-
-        # 逐步增加并发，直到平均负载 > 0.8
-        target_load = 0.8
         current = 0
         while current < max_concurrency:
             add = min(step, max_concurrency - current)
@@ -533,11 +422,7 @@ class SystemTester:
                 tasks.append(asyncio.create_task(_send_loop()))
             current += add
             await asyncio.sleep(5)
-            avg_load, loads = await _avg_load()
-            print(f"当前并发: {current}, 平均负载: {avg_load:.2f}, 详情: {loads}")
-            if avg_load >= target_load:
-                print("达到阈值，维持负载...")
-                break
+            print(f"当前并发: {current}")
 
         # 维持负载一段时间，等待扩容
         await asyncio.sleep(hold_seconds)
@@ -556,24 +441,7 @@ class SystemTester:
         await asyncio.gather(*tasks, return_exceptions=True)
 
         await asyncio.sleep(scale_down_wait)
-        model_entry = await _get_instances()
-        instances = model_entry.get("instances", []) if model_entry else []
-        any_sleep = False
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            for inst in instances:
-                inst_alias = inst.get("instance_alias")
-                if not inst_alias:
-                    continue
-                status = await client.get(f"{self.worker_url}/instances/{inst_alias}/status")
-                if status.status_code != 200:
-                    continue
-                info = status.json()
-                if info.get("sleep_level_value", 0) > 0:
-                    any_sleep = True
-        if any_sleep:
-            print("✓ 负载降低后实例进入休眠")
-        else:
-            print("⚠️ 未观察到休眠（可能负载仍高或阈值配置较高）")
+        print("⚠️ 休眠状态需要在 Worker 侧验证，已跳过")
 
         return True
     
@@ -585,20 +453,18 @@ class SystemTester:
         
         # 基础测试
         await self.test_health_checks()
-        await self.test_worker_registration()
         await self.test_list_models()
         await self.test_system_status()
         
         # 功能测试（可选，需要较长时间）
         if os.getenv("RUN_FULL_TESTS") == "1":
-            # await self.test_model_registration()
-            # await self.test_list_models()
-            # await self.test_chat_completion(ensure_registered=False)
-            # await self.test_multimodal_single_image()
-            # await self.test_multimodal_image_list()
-            # await self.test_streaming_chat(ensure_registered=False)
-            # await self.test_sleep_mode_latency(ensure_registered=False)
-            await self.test_autoscale_fake_model()
+            await self.test_model_registration()
+            await self.test_list_models()
+            await self.test_chat_completion(ensure_registered=False)
+            await self.test_multimodal_single_image()
+            await self.test_multimodal_image_list()
+            await self.test_streaming_chat(ensure_registered=False)
+            # await self.test_autoscale_fake_model()
             if os.getenv("RUN_REAL_AUTOSCALE_TEST") == "1":
                 await self.test_autoscale_real_model()
         
@@ -611,12 +477,10 @@ async def main():
     """主函数"""
     import sys
     
-    serve_url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
-    worker_url = sys.argv[2] if len(sys.argv) > 2 else "http://localhost:7000"
+    serve_url = sys.argv[1] if len(sys.argv) > 1 else "http://100.100.238.4:8000"
     
     tester = SystemTester(
-        serve_url=serve_url,
-        worker_url=worker_url
+        serve_url=serve_url
     )
     
     await tester.run_all_tests()

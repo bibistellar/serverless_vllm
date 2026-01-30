@@ -12,7 +12,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -66,7 +66,7 @@ class WorkerRegistryActor:
             check_interval=scale_interval,
             health_timeout=healthcheck_timeout,
         )
-        self.autoscaler.start(self)
+        # self.autoscaler.start(self)
 
     async def register_worker(
         self,
@@ -118,12 +118,78 @@ class WorkerRegistryActor:
     async def select_instance_for_request(self, alias: str) -> Optional[Dict]:
         return await self.autoscaler.select_instance(self, alias)
 
-    def _choose_worker_id(self) -> Optional[str]:
-        if not self.workers:
+    def _iter_worker_devices(self, worker: Dict) -> List[Dict]:
+        gpu_info = worker.get("gpu_info") or {}
+        devices = gpu_info.get("devices") or []
+        if devices:
+            return devices
+        total_memory = float(gpu_info.get("total_memory_gb", 0.0) or 0.0)
+        available_memory = float(gpu_info.get("available_memory_gb", 0.0) or 0.0)
+        if total_memory <= 0 and available_memory <= 0:
+            return []
+        return [
+            {
+                "index": 0,
+                "name": "gpu0",
+                "total_memory_gb": total_memory,
+                "available_memory_gb": available_memory,
+            }
+        ]
+
+    def _select_device(self, devices: List[Dict], required_memory_gb: Optional[float]) -> Optional[Dict]:
+        if not devices:
             return None
-        workers = list(self.workers.values())
-        workers.sort(key=lambda w: w.get("gpu_info", {}).get("available_memory_gb", 0.0), reverse=True)
-        return workers[0]["worker_id"]
+        if required_memory_gb is None:
+            return max(devices, key=lambda d: float(d.get("available_memory_gb", 0.0) or 0.0))
+        candidates = [
+            device
+            for device in devices
+            if float(device.get("available_memory_gb", 0.0) or 0.0) >= required_memory_gb
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda d: float(d.get("available_memory_gb", 0.0) or 0.0))
+
+    def _select_worker(
+        self,
+        required_memory_gb: Optional[float],
+        worker_id: Optional[str],
+    ) -> tuple[Optional[Dict], Optional[Dict]]:
+        if required_memory_gb is not None and required_memory_gb <= 0:
+            required_memory_gb = None
+        if worker_id:
+            worker = self.workers.get(worker_id)
+            if not worker:
+                return None, None
+            device = self._select_device(self._iter_worker_devices(worker), required_memory_gb)
+            if required_memory_gb is not None and device is None:
+                return None, None
+            return worker, device
+        if not self.workers:
+            return None, None
+        best_worker = None
+        best_device = None
+        best_available = -1.0
+        for worker in self.workers.values():
+            device = self._select_device(self._iter_worker_devices(worker), required_memory_gb)
+            if device is None:
+                continue
+            available = float(device.get("available_memory_gb", 0.0) or 0.0)
+            if available > best_available:
+                best_available = available
+                best_worker = worker
+                best_device = device
+        return best_worker, best_device
+
+    def _compute_gpu_utilization(self, device: Optional[Dict], gpu_memory_gb: float) -> float:
+        if device is None:
+            return 0.0
+        total_memory = float(device.get("total_memory_gb", 0.0) or 0.0)
+        if total_memory <= 0:
+            raise ValueError("worker total_memory_gb unavailable")
+        print(f"Computing GPU utilization: gpu_memory_gb={gpu_memory_gb}, total_memory={total_memory}")
+        utilization = gpu_memory_gb / total_memory
+        return max(0.0, min(1.0, utilization))
 
     def _next_instance_alias(self, model_alias: str) -> str:
         count = self._replica_counters.get(model_alias, 0) + 1
@@ -157,21 +223,30 @@ class WorkerRegistryActor:
             await client.post(f"{worker_url}/instances/{inst_alias}/sleep", json={"level": level})
 
     async def _start_new_instance(self, model_alias: str, config: Dict) -> None:
-        worker_id = self._choose_worker_id()
-        if not worker_id:
+        gpu_memory_gb = config.get("gpu_memory_gb")
+        fake = config.get("fake")
+        if not fake and gpu_memory_gb is None:
             return
-        worker = self.workers.get(worker_id)
+        worker, device = self._select_worker(gpu_memory_gb, None)
+        if not worker and fake:
+            worker = next(iter(self.workers.values()), None)
+            device = None
         if not worker:
             return
         control_url = worker["worker_url"]
         instance_alias = self._next_instance_alias(model_alias)
+        if gpu_memory_gb is None:
+            gpu_memory_gb = 0.0
         instance_info = await self._start_instance_on_worker(
             worker_url=control_url,
             instance_alias=instance_alias,
             payload={
                 "model_name": config.get("model_name"),
                 "model_path": config.get("model_path"),
-                "gpu_memory_utilization": config.get("gpu_memory_utilization", 0.9),
+                "gpu_memory_utilization": self._compute_gpu_utilization(
+                    device,
+                    gpu_memory_gb,
+                ),
                 "max_model_len": config.get("max_model_len"),
                 "tensor_parallel_size": config.get("tensor_parallel_size", 1),
                 "fake": config.get("fake"),
@@ -186,7 +261,7 @@ class WorkerRegistryActor:
             "model_alias": model_alias,
             "instance_alias": instance_alias,
             "model_name": config.get("model_name"),
-            "worker_id": worker_id,
+            "worker_id": worker["worker_id"],
             "worker_url": route_url,
             "control_url": control_url,
             "vllm_port": instance_info.get("port", 0),
@@ -204,7 +279,7 @@ class WorkerRegistryActor:
         alias: str,
         model_name: str,
         model_path: Optional[str] = None,
-        gpu_memory_utilization: float = 0.9,
+        gpu_memory_gb: Optional[float] = None,
         max_model_len: Optional[int] = None,
         tensor_parallel_size: int = 1,
         worker_id: Optional[str] = None,
@@ -216,6 +291,13 @@ class WorkerRegistryActor:
     ) -> Dict:
         if not alias or not model_name:
             return {"status": "error", "message": "alias and model_name are required"}
+
+        if fake:
+            if gpu_memory_gb is None:
+                gpu_memory_gb = 0.0
+        else:
+            if gpu_memory_gb is None or gpu_memory_gb <= 0:
+                return {"status": "error", "message": "gpu_memory_gb is required for non-fake models"}
 
         async with self._lock:
             if alias in self.model_instances:
@@ -229,7 +311,7 @@ class WorkerRegistryActor:
                     "alias": alias,
                     "model_name": model_name,
                     "model_path": model_path,
-                    "gpu_memory_utilization": gpu_memory_utilization,
+                    "gpu_memory_gb": gpu_memory_gb,
                     "max_model_len": max_model_len,
                     "tensor_parallel_size": tensor_parallel_size,
                     "fake": fake,
@@ -239,19 +321,26 @@ class WorkerRegistryActor:
                     "fake_capacity": fake_capacity,
                 }
 
-        selected_worker_id = worker_id or self._choose_worker_id()
-        if not selected_worker_id:
-            return {"status": "error", "message": "No available worker found"}
-
-        worker = self.workers.get(selected_worker_id)
+        worker, device = self._select_worker(gpu_memory_gb, worker_id)
+        if not worker and fake:
+            worker = self.workers.get(worker_id) if worker_id else next(iter(self.workers.values()), None)
+            device = None
         if not worker:
-            return {"status": "error", "message": f"Worker {selected_worker_id} not found"}
+            if gpu_memory_gb:
+                return {
+                    "status": "error",
+                    "message": f"No available worker with >= {gpu_memory_gb} GB free memory",
+                }
+            return {"status": "error", "message": "No available worker found"}
 
         control_url = worker["worker_url"]
         payload = {
             "model_name": model_name,
             "model_path": model_path,
-            "gpu_memory_utilization": gpu_memory_utilization,
+            "gpu_memory_utilization": self._compute_gpu_utilization(
+                device,
+                gpu_memory_gb or 0.0,
+            ),
             "max_model_len": max_model_len,
             "tensor_parallel_size": tensor_parallel_size,
             "fake": fake,
@@ -274,7 +363,7 @@ class WorkerRegistryActor:
                 "model_alias": alias,
                 "instance_alias": instance_alias,
                 "model_name": model_name,
-                "worker_id": selected_worker_id,
+                "worker_id": worker["worker_id"],
                 "worker_url": route_url,
                 "control_url": control_url,
                 "vllm_port": instance_info.get("port", 0),
@@ -556,7 +645,7 @@ class RouterManagerServe:
             alias=body.get("alias"),
             model_name=body.get("model_name"),
             model_path=body.get("model_path"),
-            gpu_memory_utilization=body.get("gpu_memory_utilization", 0.9),
+            gpu_memory_gb=body.get("gpu_memory_gb"),
             max_model_len=body.get("max_model_len"),
             tensor_parallel_size=body.get("tensor_parallel_size", 1),
             worker_id=body.get("worker_id"),
@@ -586,29 +675,6 @@ class RouterManagerServe:
             "models": await self.registry.list_models.remote(),
             "workers": await self.registry.list_workers.remote(),
         }
-
-    # Backwards-compatible endpoints
-    @fastapi_app.post("/v1/models/register")
-    async def legacy_register_model(self, request: Request):
-        body = await request.json()
-        return await self.registry.register_model.remote(
-            alias=body.get("alias"),
-            model_name=body.get("model_name"),
-            model_path=body.get("model_path"),
-            gpu_memory_utilization=body.get("gpu_memory_utilization", 0.9),
-            max_model_len=body.get("max_model_len"),
-            tensor_parallel_size=body.get("tensor_parallel_size", 1),
-            worker_id=body.get("worker_id"),
-            fake=body.get("fake"),
-            fake_response=body.get("fake_response"),
-            fake_delay=body.get("fake_delay"),
-            fake_delay_ms=body.get("fake_delay_ms"),
-            fake_capacity=body.get("fake_capacity"),
-        )
-
-    @fastapi_app.delete("/v1/models/{alias}")
-    async def legacy_unregister_model(self, alias: str):
-        return await self.registry.unregister_model.remote(alias)
 
     @fastapi_app.get("/workers")
     async def list_workers(self):

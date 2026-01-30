@@ -53,10 +53,13 @@ curl -X POST http://localhost:8000/admin/models/register \
   -d '{
     "alias": "qwen3-vl-2b",
     "model_name": "Qwen/Qwen3-VL-2B-Instruct",
-    "gpu_memory_utilization": 0.6,
+    "gpu_memory_gb": 2.0,
     "max_model_len": 2048
   }'
 ```
+
+说明：
+- `gpu_memory_gb`：按显存绝对值分配，服务端会根据 worker 总显存换算为 utilization（非 fake 模型必填）
 
 ### 4) 推理请求（OpenAI 兼容）
 ```bash

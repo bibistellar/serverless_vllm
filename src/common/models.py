@@ -21,6 +21,25 @@ class InstanceStatus(str, Enum):
 
 
 @dataclass
+class GPUDeviceInfo:
+    """单张 GPU 信息"""
+    index: int
+    name: str
+    total_memory_gb: float
+    available_memory_gb: float
+    utilization: float = 0.0
+
+    def to_dict(self) -> Dict:
+        return {
+            "index": self.index,
+            "name": self.name,
+            "total_memory_gb": self.total_memory_gb,
+            "available_memory_gb": self.available_memory_gb,
+            "utilization": self.utilization,
+        }
+
+
+@dataclass
 class GPUInfo:
     """GPU 信息"""
     gpu_count: int
@@ -28,6 +47,7 @@ class GPUInfo:
     total_memory_gb: float
     available_memory_gb: float
     utilization: float = 0.0
+    devices: List[GPUDeviceInfo] = field(default_factory=list)
     
     def to_dict(self) -> Dict:
         return {
@@ -35,7 +55,8 @@ class GPUInfo:
             "gpu_names": self.gpu_names,
             "total_memory_gb": self.total_memory_gb,
             "available_memory_gb": self.available_memory_gb,
-            "utilization": self.utilization
+            "utilization": self.utilization,
+            "devices": [device.to_dict() for device in self.devices],
         }
 
 
