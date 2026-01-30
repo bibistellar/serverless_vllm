@@ -95,6 +95,8 @@ class LoadBasedAutoscaler:
                             instance["sleep_level_value"] = sleep_level
                             instance["load"] = load
                             instance["capacity"] = capacity
+                            if "status" in status:
+                                instance["status"] = status["status"]
                     except Exception as exc:
                         logger.debug("Failed to refresh instance %s: %s", inst_alias, exc)
 

@@ -333,6 +333,9 @@ class VLLMManager:
 
         if alias in self.fake_instances:
             self.sleep_levels[alias] = level
+            instance = self.instances.get(alias)
+            if instance:
+                instance.status = InstanceStatus.RUNNING if level == SleepLevel.ACTIVE else InstanceStatus.SLEEPING
             return True
         
         if level != SleepLevel.ACTIVE:
@@ -354,8 +357,13 @@ class VLLMManager:
         logger.info(f"Setting {alias} from {current_level.name} to {level.name}")
         
         try:
+            instance = self.instances.get(alias)
+            if instance and level != SleepLevel.ACTIVE:
+                instance.status = InstanceStatus.SLEEPING
             async with self._lifecycle_locks[alias]:
                 if level == SleepLevel.ACTIVE:
+                    if instance and current_level == SleepLevel.UNLOADED:
+                        instance.status = InstanceStatus.STARTING
                     # 从任何睡眠级别唤醒到激活状态
                     await self._wake_up(alias, current_level)
                 elif level == SleepLevel.SLEEP_1:
@@ -385,6 +393,8 @@ class VLLMManager:
                     await self._unload(alias)
             
             self.sleep_levels[alias] = level
+            if instance and level == SleepLevel.ACTIVE:
+                instance.status = InstanceStatus.RUNNING
             logger.info(f"✅ Instance {alias} now at sleep level {level.name}")
             return True
             
@@ -418,6 +428,10 @@ class VLLMManager:
         engine = self.engines.pop(alias, None)
         if engine:
             del engine  # 显式删除，让 GC 回收
+
+        instance = self.instances.get(alias)
+        if instance:
+            instance.status = InstanceStatus.SLEEPING
             
         logger.info(f"✅ {alias} unloaded")
     
@@ -471,8 +485,13 @@ class VLLMManager:
         engine_args = self.engine_args[alias]
         if replace_existing:
             self.engines.pop(alias, None)
-        engine = AsyncLLMEngine.from_engine_args(engine_args)
+        instance = self.instances.get(alias)
+        if instance:
+            instance.status = InstanceStatus.STARTING
+        engine = await asyncio.to_thread(AsyncLLMEngine.from_engine_args, engine_args)
         self.engines[alias] = engine
+        if instance:
+            instance.status = InstanceStatus.RUNNING
         
         elapsed = time.time() - start_time
         logger.info(f"✅ {alias} reloaded (took {elapsed:.1f}s)")

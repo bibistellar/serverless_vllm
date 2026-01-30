@@ -53,8 +53,8 @@ curl -X POST http://localhost:8000/admin/models/register \
   -d '{
     "alias": "qwen3-vl-2b",
     "model_name": "Qwen/Qwen3-VL-2B-Instruct",
-    "gpu_memory_gb": 2.0,
-    "max_model_len": 2048
+    "gpu_memory_gb": 12.0,
+    "max_model_len": 4096
   }'
 ```
 

@@ -338,6 +338,9 @@ class WorkerService:
             instance = self.vllm_manager.get_instance(alias)
             if not instance:
                 raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
+
+            # 自动唤醒（包括 UNLOADED）
+            await self.vllm_manager.ensure_active(alias)
             
             # 检查模型状态
             if instance.status == InstanceStatus.STARTING:
@@ -424,6 +427,9 @@ class WorkerService:
             instance = self.vllm_manager.get_instance(alias)
             if not instance:
                 raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
+
+            # 自动唤醒（包括 UNLOADED）
+            await self.vllm_manager.ensure_active(alias)
             
             # 检查模型状态
             if instance.status == InstanceStatus.STARTING:

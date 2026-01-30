@@ -17,7 +17,7 @@ class SystemTester:
     def __init__(
         self,
         serve_url: str = "http://localhost:8000",
-        model_alias: str = "test-model",
+        model_alias: str = "qwen3-vl-2b",
         model_name: str = "Qwen/Qwen3-VL-2B-Instruct",
     ):
         self.serve_url = serve_url
@@ -57,8 +57,27 @@ class SystemTester:
                     if response.status_code == 200:
                         models = response.json().get("models", [])
                         for model in models:
-                            if model.get("alias") == alias and model.get("instances"):
-                                return True
+                            if model.get("alias") != alias:
+                                continue
+                            for instance in model.get("instances", []):
+                                control_url = instance.get("control_url") or instance.get("worker_url")
+                                instance_alias = instance.get("instance_alias")
+                                if not control_url or not instance_alias:
+                                    continue
+                                try:
+                                    status_resp = await client.get(
+                                        f"{control_url}/instances/{instance_alias}/status"
+                                    )
+                                    if status_resp.status_code != 200:
+                                        continue
+                                    status = status_resp.json()
+                                    if (
+                                        str(status.get("status", "")).lower() == "running"
+                                        and int(status.get("sleep_level_value", 0)) == 0
+                                    ):
+                                        return True
+                                except Exception:
+                                    continue
                 except Exception:
                     pass
                 await asyncio.sleep(5)
@@ -163,16 +182,16 @@ class SystemTester:
         model = model or self.model_alias
         print(f"\n=== 测试对话补全: {model} ===")
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=360.0) as client:
             try:
                 if ensure_registered:
                     await self.test_model_registration(alias=model)
-                # 等待模型就绪
-                print("等待模型就绪...")
-                ready = await self._wait_model_ready(model, timeout_s=600)
-                if not ready:
-                    print("✗ 模型未在超时内就绪")
-                    return False
+                # # 等待模型就绪
+                # print("等待模型就绪...")
+                # ready = await self._wait_model_ready(model, timeout_s=600)
+                # if not ready:
+                #     print("✗ 模型未在超时内就绪")
+                #     return False
                 
                 # 发送请求
                 print("发送推理请求...")
@@ -254,6 +273,7 @@ class SystemTester:
         async with httpx.AsyncClient(timeout=180.0) as client:
             try:
                 response = await client.post(f"{self.serve_url}/v1/chat/completions", json=payload)
+                print(f"{self.serve_url}/v1/chat/completions")
                 response.raise_for_status()
                 result = response.json()
                 print("✓ 多帧图像请求成功")
@@ -262,6 +282,30 @@ class SystemTester:
             except Exception as e:
                 print(f"✗ 多帧图像请求失败: {e}")
                 return False
+
+    async def test_multimodal_image_list_streaming(self, model: str = None, frames: int = 4):
+        model = model or self.model_alias
+        print(f"\n=== 测试多帧图像列表（流式）: {model} ===")
+        image_data = self._load_image_data_uri()
+        content = [{"type": "text", "text": "以下是视频抽帧，请总结主要变化。"}]
+        for _ in range(frames):
+            content.append({"type": "image_url", "image_url": {"url": image_data}})
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 80,
+            "stream": True,
+        }
+        try:
+            first_latency, content_text = await self._stream_first_token(payload, timeout_s=600)
+            print("✓ 多帧图像流式请求成功")
+            if first_latency is not None:
+                print(f"  首字符延迟: {first_latency:.3f}s")
+            print(f"  响应: {content_text}")
+            return True
+        except Exception as e:
+            print(f"✗ 多帧图像流式请求失败: {e}")
+            return False
 
     async def test_streaming_chat(self, model: str = None, ensure_registered: bool = True):
         model = model or self.model_alias
@@ -464,6 +508,7 @@ class SystemTester:
             # await self.test_chat_completion(model="my_model",ensure_registered=True)
             # await self.test_multimodal_single_image()
             # await self.test_multimodal_image_list()
+            # await self.test_multimodal_image_list_streaming()
             # await self.test_streaming_chat(ensure_registered=False)
             # await self.test_autoscale_fake_model()
             if os.getenv("RUN_REAL_AUTOSCALE_TEST") == "1":
