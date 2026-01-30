@@ -1,203 +1,161 @@
-# Serverless vLLM - 分布式 LLM 服务池
+# model_pool_serve README
 
-基于 HTTP 通信的解耦架构，支持多机 GPU 资源池化和动态路由。
+Ray Serve 控制面 + Worker 执行面的 OpenAI 兼容推理服务。
 
-## 架构概述
+本 README 为唯一权威文档，旧文档已移除。
 
-### 组件
+## 组件与职责
 
-1. **Manager (中央管理器)** - 端口 9000
-   - 接收 Worker 注册和心跳
-   - 维护 Worker 和模型路由表
-   - 决策模型部署位置
-   - 监控 Worker 健康状态
+### Serve（Ray Serve 控制面）
+- 对外提供 OpenAI 兼容 API 与管理 API（单入口）。
+- 维护 Worker 与模型实例映射。
+- 依据负载自动扩/缩容（多实例/多副本）。
+- 负载策略集中在 `src/serve/autoscaler.py`。
 
-2. **Worker (工作节点)** - 端口 7000+
-   - 检测本机 GPU 环境
-   - 管理 vLLM 实例生命周期
-   - 提供动态路由代理
-   - 定期向 Manager 发送心跳
-
-3. **Router (API 网关)** - 端口 8000
-   - 提供 OpenAI 兼容 API
-   - 路由请求到对应的 Worker
-   - 管理接口（注册/注销模型）
-
-### 通信方式
-
-- Manager ↔ Worker: HTTP (注册、心跳、指令)
-- Router ↔ Manager: HTTP (查询路由)
-- Router ↔ Worker: HTTP (转发推理请求)
-- Worker ↔ vLLM: HTTP (本地 proxy)
+### Worker（执行面）
+- 常驻服务，管理本机 vLLM 实例生命周期。
+- 支持 sleep/wake/unload。
+- 直接在进程内使用 `AsyncLLMEngine`（无独立 vLLM server）。
+- `/instances/{alias}/status` 提供负载与延迟指标（TTFT/E2E）。
 
 ### 关键特性
-
-- ✅ 完全解耦，无 Ray 依赖
-- ✅ HTTP 通信，易于跨机部署
-- ✅ 动态启动 vLLM server
-- ✅ 随机端口 + alias 路由
-- ✅ 自动心跳和健康检查
-- ✅ OpenAI 兼容 API
-- ✅ 多 Worker 负载均衡
+- OpenAI 兼容 API（支持流式输出）。
+- 单 alias 多实例（alias-r2、alias-r3…）。
+- 负载自动扩容/缩容。
+- 假模型（fake）用于调度压测。
 
 ## 快速开始
 
-### 本地开发模式
-
-1. **安装依赖**
+### 1) 启动 Serve
 ```bash
-pip install -r requirements.txt
+bash scripts/start_serve.sh
 ```
 
-2. **启动 Manager**
-```bash
-bash scripts/start_manager.sh
-```
+可选环境变量：
+- `SERVE_HOST` / `SERVE_PORT`
+- `RAY_ADDRESS` / `RAY_WORKING_DIR`
+- `SERVE_MAX_ONGOING_REQUESTS`（默认 100）
+- `MODEL_LOAD_HIGH` / `MODEL_LOAD_LOW`
+- `MODEL_INSTANCE_CAPACITY`
+- `MODEL_MIN_REPLICAS` / `MODEL_MAX_REPLICAS`
+- `MODEL_SCALE_INTERVAL`
 
-3. **启动 Worker（新终端）**
+### 2) 启动 Worker
 ```bash
-export WORKER_ID=worker-1
-export MANAGER_URL=http://localhost:9000
+export MANAGER_URL=http://127.0.0.1:8000
 bash scripts/start_worker.sh
 ```
 
-4. **启动 Router（新终端）**
-```bash
-export MANAGER_URL=http://localhost:9000
-bash scripts/start_router.sh
-```
-
-5. **注册模型**
+### 3) 注册模型
 ```bash
 curl -X POST http://localhost:8000/admin/models/register \
   -H "Content-Type: application/json" \
   -d '{
-    "alias": "qwen-vl-2b",
+    "alias": "qwen3-vl-2b",
     "model_name": "Qwen/Qwen3-VL-2B-Instruct",
-    "gpu_memory_utilization": 0.9,
-    "max_model_len": 8192
+    "gpu_memory_utilization": 0.6,
+    "max_model_len": 2048
   }'
 ```
 
-6. **发送推理请求**
+### 4) 推理请求（OpenAI 兼容）
 ```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
+curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen-vl-2b",
-    "messages": [
-      {"role": "user", "content": "你好"}
-    ]
+    "model": "qwen3-vl-2b",
+    "messages": [{"role": "user", "content": "你好"}]
   }'
 ```
 
-### Docker 部署模式
+## OpenAI SDK 用法
+```python
+from openai import OpenAI
 
-1. **构建镜像**
-```bash
-docker-compose -f config/docker-compose.yaml build
+client = OpenAI(base_url="http://localhost:8000", api_key="dummy")
+resp = client.chat.completions.create(
+    model="qwen3-vl-2b",
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(resp.choices[0].message.content)
 ```
 
-2. **启动服务**
+## 自动扩缩策略
+
+策略集中在 `src/serve/autoscaler.py`：
+- 平均负载 > 0.7：优先唤醒休眠实例，否则启动新实例。
+- 平均负载 < 0.3：按 ACTIVE → SLEEP_1 → SLEEP_2 → UNLOADED 逐步休眠。
+- 负载 = `inflight_requests / capacity`（capacity 可配置或从假模型返回）。
+
+## 假模型（调度压测）
+
+注册 fake 模型：
 ```bash
-docker-compose -f config/docker-compose.yaml up -d
+curl -X POST http://localhost:8000/admin/models/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "alias": "fake-model",
+    "model_name": "__fake__",
+    "fake": true,
+    "fake_response": "FAKE_OK",
+    "fake_delay_ms": 3000,
+    "fake_capacity": 1
+  }'
 ```
 
-3. **查看日志**
+该模型不加载权重，按延迟/并发模拟负载。
+
+## API 说明（简版）
+
+### Serve（对外）
+- `GET /health`
+- `POST /v1/chat/completions`（支持 `stream`）
+- `POST /v1/completions`
+- `GET /v1/models`
+- `POST /admin/models/register`
+- `DELETE /admin/models/{alias}`
+- `GET /admin/models`
+- `GET /admin/workers`
+- `GET /admin/status`
+- `POST /workers/register`
+- `DELETE /workers/{worker_id}/unregister`
+
+### Worker（内部）
+- `GET /health`
+- `GET /info`
+- `POST /instances/start`
+- `POST /instances/{alias}/stop`
+- `GET /instances`
+- `GET /instances/{alias}`
+- `GET /instances/{alias}/status`
+- `POST /instances/{alias}/sleep`
+- `POST /instances/{alias}/wake`
+- `POST /proxy/{alias}/v1/chat/completions`
+- `POST /proxy/{alias}/v1/completions`
+
+### `/instances/{alias}/status` 返回字段
+- `sleep_level_value`
+- `inflight_requests`
+- `ttft_last` / `ttft_avg`
+- `e2e_last` / `e2e_avg`
+- `gpu_info`（含 `available_memory_gb`、`utilization`）
+
+## 测试
+
+基础测试：
 ```bash
-docker-compose -f config/docker-compose.yaml logs -f
+python tests/test_system.py http://localhost:8000 http://localhost:7000
 ```
 
-## API 文档
-
-### OpenAI 兼容 API
-
-**Chat Completions**
+完整测试（包含假模型扩容）：
 ```bash
-POST /v1/chat/completions
-Content-Type: application/json
-
-{
-  "model": "qwen-vl-2b",
-  "messages": [
-    {"role": "user", "content": "Hello"}
-  ],
-  "max_tokens": 128,
-  "temperature": 0.7
-}
+RUN_FULL_TESTS=1 python tests/test_system.py http://localhost:8000 http://localhost:7000
 ```
 
-**List Models**
+真模型扩容测试：
 ```bash
-GET /v1/models
+RUN_FULL_TESTS=1 RUN_REAL_AUTOSCALE_TEST=1 python tests/test_system.py http://localhost:8000 http://localhost:7000
 ```
-
-### 管理 API
-
-**注册模型**
-```bash
-POST /admin/models/register
-Content-Type: application/json
-
-{
-  "alias": "model-name",
-  "model_name": "path/to/model",
-  "worker_id": "worker-1"  # 可选
-}
-```
-
-**注销模型**
-```bash
-DELETE /admin/models/{alias}
-```
-
-**列出 Workers**
-```bash
-GET /admin/workers
-```
-
-**系统状态**
-```bash
-GET /admin/status
-```
-
-### Worker API
-
-**健康检查**
-```bash
-GET /health
-```
-
-**Worker 信息**
-```bash
-GET /info
-```
-
-**启动实例**
-```bash
-POST /instances/start
-Content-Type: application/json
-
-{
-  "alias": "model-1",
-  "model_name": "Qwen/Qwen3-VL-2B-Instruct"
-}
-```
-
-**停止实例**
-```bash
-POST /instances/{alias}/stop
-```
-
-**代理请求**
-```bash
-POST /proxy/{alias}/v1/chat/completions
-```
-
-### Manager API
-
-**Worker 注册**
-```bash
 POST /workers/register
 Content-Type: application/json
 

@@ -12,6 +12,9 @@ transformers>=4.36.0
 # Optional: for GPU monitoring
 pynvml>=11.5.0
 
+# Ray Serve (control plane)
+ray[serve]>=2.9.0
+
 # Optional: for Qwen-VL support
 qwen-vl-utils
 Pillow>=10.0.0

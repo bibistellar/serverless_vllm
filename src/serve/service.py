@@ -1,0 +1,692 @@
+"""Ray Serve Router+Manager Service
+
+将 Router 与 Manager 合并为一个 Ray Serve 服务，并通过内部 Ray Actor
+对接外部 Worker 的 vLLM 实例（HTTP 方式）。
+
+默认网络可连通，不做心跳保活逻辑，减少控制面复杂度。
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Dict, Optional
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+import ray
+from ray import serve
+
+from src.serve.autoscaler import LoadBasedAutoscaler
+
+logger = logging.getLogger(__name__)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+
+
+@ray.remote(max_concurrency=200)
+class WorkerRegistryActor:
+    """管理外部 Worker 与 vLLM 实例的注册与路由信息。"""
+
+    def __init__(
+        self,
+        healthcheck_interval: float = 15.0,
+        healthcheck_timeout: float = 3.0,
+        max_failures: int = 3,
+        load_high: float = 0.7,
+        load_low: float = 0.3,
+        instance_capacity: int = 4,
+        min_replicas: int = 1,
+        max_replicas: int = 8,
+        scale_interval: float = 10.0,
+    ) -> None:
+        self.workers: Dict[str, Dict] = {}
+        self.model_instances: Dict[str, list] = {}
+        self.model_configs: Dict[str, Dict] = {}
+        self.failure_counts: Dict[str, int] = {}
+        self._replica_counters: Dict[str, int] = {}
+        self._rr_index = 0
+        self._lock = asyncio.Lock()
+        self.healthcheck_interval = healthcheck_interval
+        self.healthcheck_timeout = healthcheck_timeout
+        self.max_failures = max_failures
+        self._health_task = asyncio.create_task(self._health_loop())
+        self.autoscaler = LoadBasedAutoscaler(
+            load_high=load_high,
+            load_low=load_low,
+            instance_capacity=instance_capacity,
+            min_replicas=min_replicas,
+            max_replicas=max_replicas,
+            check_interval=scale_interval,
+            health_timeout=healthcheck_timeout,
+        )
+        self.autoscaler.start(self)
+
+    async def register_worker(
+        self,
+        worker_id: str,
+        worker_url: str,
+        public_worker_url: Optional[str] = None,
+        gpu_info: Optional[Dict] = None,
+    ) -> Dict:
+        if not worker_id or not worker_url:
+            return {"status": "error", "message": "worker_id and worker_url are required"}
+
+        async with self._lock:
+            self.workers[worker_id] = {
+                "worker_id": worker_id,
+                "worker_url": worker_url.rstrip("/"),
+                "public_worker_url": public_worker_url.rstrip("/") if public_worker_url else None,
+                "gpu_info": gpu_info or {},
+                "registered_at": time.time(),
+            }
+            self.failure_counts[worker_id] = 0
+
+        return {"status": "success", "message": f"Worker {worker_id} registered"}
+
+    async def unregister_worker(self, worker_id: str) -> Dict:
+        async with self._lock:
+            return self._unregister_worker_locked(worker_id)
+
+    async def list_workers(self) -> Dict:
+        return {"workers": list(self.workers.values())}
+
+    async def list_models(self) -> Dict:
+        return {
+            "models": [
+                {
+                    "alias": alias,
+                    "instances": list(instances),
+                    "config": self.model_configs.get(alias, {}),
+                }
+                for alias, instances in self.model_instances.items()
+            ]
+        }
+
+    async def get_model_routing(self, alias: str) -> Optional[Dict]:
+        instances = self.model_instances.get(alias, [])
+        if not instances:
+            return None
+        return instances[0]
+
+    async def select_instance_for_request(self, alias: str) -> Optional[Dict]:
+        return await self.autoscaler.select_instance(self, alias)
+
+    def _choose_worker_id(self) -> Optional[str]:
+        if not self.workers:
+            return None
+        workers = list(self.workers.values())
+        workers.sort(key=lambda w: w.get("gpu_info", {}).get("available_memory_gb", 0.0), reverse=True)
+        return workers[0]["worker_id"]
+
+    def _next_instance_alias(self, model_alias: str) -> str:
+        count = self._replica_counters.get(model_alias, 0) + 1
+        self._replica_counters[model_alias] = count
+        if count == 1:
+            return model_alias
+        return f"{model_alias}-r{count}"
+
+    async def _start_instance_on_worker(self, worker_url: str, instance_alias: str, payload: Dict) -> Dict:
+        new_payload = dict(payload)
+        new_payload["alias"] = instance_alias
+        async with httpx.AsyncClient(timeout=1800.0) as client:
+            response = await client.post(f"{worker_url}/instances/start", json=new_payload)
+            response.raise_for_status()
+            return response.json().get("instance", {})
+
+    async def _wake_instance(self, instance: Dict) -> None:
+        worker_url = instance.get("control_url") or instance.get("worker_url")
+        inst_alias = instance.get("instance_alias")
+        if not worker_url or not inst_alias:
+            return
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            await client.post(f"{worker_url}/instances/{inst_alias}/wake")
+
+    async def _sleep_instance(self, instance: Dict, level: int) -> None:
+        worker_url = instance.get("control_url") or instance.get("worker_url")
+        inst_alias = instance.get("instance_alias")
+        if not worker_url or not inst_alias:
+            return
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            await client.post(f"{worker_url}/instances/{inst_alias}/sleep", json={"level": level})
+
+    async def _start_new_instance(self, model_alias: str, config: Dict) -> None:
+        worker_id = self._choose_worker_id()
+        if not worker_id:
+            return
+        worker = self.workers.get(worker_id)
+        if not worker:
+            return
+        control_url = worker["worker_url"]
+        instance_alias = self._next_instance_alias(model_alias)
+        instance_info = await self._start_instance_on_worker(
+            worker_url=control_url,
+            instance_alias=instance_alias,
+            payload={
+                "model_name": config.get("model_name"),
+                "model_path": config.get("model_path"),
+                "gpu_memory_utilization": config.get("gpu_memory_utilization", 0.9),
+                "max_model_len": config.get("max_model_len"),
+                "tensor_parallel_size": config.get("tensor_parallel_size", 1),
+                "fake": config.get("fake"),
+                "fake_response": config.get("fake_response"),
+                "fake_delay": config.get("fake_delay"),
+                "fake_delay_ms": config.get("fake_delay_ms"),
+                "fake_capacity": config.get("fake_capacity"),
+            },
+        )
+        route_url = worker.get("public_worker_url") or worker.get("worker_url")
+        instance = {
+            "model_alias": model_alias,
+            "instance_alias": instance_alias,
+            "model_name": config.get("model_name"),
+            "worker_id": worker_id,
+            "worker_url": route_url,
+            "control_url": control_url,
+            "vllm_port": instance_info.get("port", 0),
+            "created_at": time.time(),
+            "sleep_level_value": 0,
+            "inflight_requests": 0,
+            "load": 0.0,
+            "capacity": config.get("fake_capacity"),
+        }
+        async with self._lock:
+            self.model_instances.setdefault(model_alias, []).append(instance)
+
+    async def register_model(
+        self,
+        alias: str,
+        model_name: str,
+        model_path: Optional[str] = None,
+        gpu_memory_utilization: float = 0.9,
+        max_model_len: Optional[int] = None,
+        tensor_parallel_size: int = 1,
+        worker_id: Optional[str] = None,
+        fake: Optional[bool] = None,
+        fake_response: Optional[str] = None,
+        fake_delay: Optional[float] = None,
+        fake_delay_ms: Optional[int] = None,
+        fake_capacity: Optional[int] = None,
+    ) -> Dict:
+        if not alias or not model_name:
+            return {"status": "error", "message": "alias and model_name are required"}
+
+        async with self._lock:
+            if alias in self.model_instances:
+                return {
+                    "status": "exists",
+                    "message": f"Model {alias} already registered",
+                    "routing": self.model_instances[alias][0],
+                }
+            if alias not in self.model_configs:
+                self.model_configs[alias] = {
+                    "alias": alias,
+                    "model_name": model_name,
+                    "model_path": model_path,
+                    "gpu_memory_utilization": gpu_memory_utilization,
+                    "max_model_len": max_model_len,
+                    "tensor_parallel_size": tensor_parallel_size,
+                    "fake": fake,
+                    "fake_response": fake_response,
+                    "fake_delay": fake_delay,
+                    "fake_delay_ms": fake_delay_ms,
+                    "fake_capacity": fake_capacity,
+                }
+
+        selected_worker_id = worker_id or self._choose_worker_id()
+        if not selected_worker_id:
+            return {"status": "error", "message": "No available worker found"}
+
+        worker = self.workers.get(selected_worker_id)
+        if not worker:
+            return {"status": "error", "message": f"Worker {selected_worker_id} not found"}
+
+        control_url = worker["worker_url"]
+        payload = {
+            "model_name": model_name,
+            "model_path": model_path,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "max_model_len": max_model_len,
+            "tensor_parallel_size": tensor_parallel_size,
+            "fake": fake,
+            "fake_response": fake_response,
+            "fake_delay": fake_delay,
+            "fake_delay_ms": fake_delay_ms,
+            "fake_capacity": fake_capacity,
+        }
+
+        try:
+            instance_alias = self._next_instance_alias(alias)
+            instance_info = await self._start_instance_on_worker(
+                worker_url=control_url,
+                instance_alias=instance_alias,
+                payload=payload,
+            )
+
+            route_url = worker["public_worker_url"] or worker["worker_url"]
+            routing = {
+                "model_alias": alias,
+                "instance_alias": instance_alias,
+                "model_name": model_name,
+                "worker_id": selected_worker_id,
+                "worker_url": route_url,
+                "control_url": control_url,
+                "vllm_port": instance_info.get("port", 0),
+                "created_at": time.time(),
+                "sleep_level_value": 0,
+                "inflight_requests": 0,
+                "load": 0.0,
+                "capacity": fake_capacity if fake_capacity is not None else None,
+            }
+
+            async with self._lock:
+                self.model_instances.setdefault(alias, []).append(routing)
+
+            return {
+                "status": "success",
+                "message": f"Model {alias} instance {instance_alias} registered",
+                "routing": routing,
+            }
+        except Exception as exc:
+            logger.error("Failed to start instance on worker %s: %s", selected_worker_id, exc)
+            return {"status": "error", "message": f"Failed to start instance: {exc}"}
+
+    async def unregister_model(self, alias: str) -> Dict:
+        instances = self.model_instances.get(alias)
+        if not instances:
+            return {"status": "error", "message": f"Model {alias} not found"}
+
+        for instance in list(instances):
+            worker_id = instance.get("worker_id")
+            worker = self.workers.get(worker_id) if worker_id else None
+            control_url = worker["worker_url"] if worker else instance.get("worker_url")
+
+            if control_url:
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        await client.post(f"{control_url}/instances/{instance['instance_alias']}/stop")
+                except Exception as exc:
+                    logger.warning("Failed to stop instance %s: %s", instance["instance_alias"], exc)
+
+        async with self._lock:
+            self.model_instances.pop(alias, None)
+            self.model_configs.pop(alias, None)
+            self._replica_counters.pop(alias, None)
+
+        return {"status": "success", "message": f"Model {alias} unregistered"}
+
+    async def health(self) -> Dict:
+        return {
+            "status": "ok",
+            "service": "serve",
+            "workers": len(self.workers),
+            "models": len(self.model_instances),
+        }
+
+    def _unregister_worker_locked(self, worker_id: str) -> Dict:
+        if worker_id not in self.workers:
+            return {"status": "error", "message": f"Worker {worker_id} not found"}
+
+        aliases_to_remove = [
+            alias for alias, instances in self.model_instances.items()
+            if any(inst.get("worker_id") == worker_id for inst in instances)
+        ]
+        for alias in aliases_to_remove:
+            instances = [
+                inst for inst in self.model_instances.get(alias, [])
+                if inst.get("worker_id") != worker_id
+            ]
+            if instances:
+                self.model_instances[alias] = instances
+            else:
+                self.model_instances.pop(alias, None)
+
+        self.workers.pop(worker_id, None)
+        self.failure_counts.pop(worker_id, None)
+        return {"status": "success", "message": f"Worker {worker_id} unregistered"}
+
+    async def _ping_worker(self, worker_url: str) -> Optional[Dict]:
+        async with httpx.AsyncClient(timeout=self.healthcheck_timeout) as client:
+            response = await client.get(f"{worker_url}/health")
+            if response.status_code == 200:
+                return response.json()
+            return None
+
+    async def _health_loop(self):
+        while True:
+            await asyncio.sleep(self.healthcheck_interval)
+            if not self.workers:
+                continue
+            worker_ids = list(self.workers.keys())
+            for worker_id in worker_ids:
+                worker = self.workers.get(worker_id)
+                if not worker:
+                    continue
+                worker_url = worker.get("worker_url")
+                if not worker_url:
+                    continue
+                ok = False
+                health = None
+                try:
+                    health = await self._ping_worker(worker_url)
+                    ok = health is not None
+                except Exception as exc:
+                    logger.warning("Worker health check failed: %s (%s)", worker_id, exc)
+                async with self._lock:
+                    if worker_id not in self.workers:
+                        continue
+                    if ok:
+                        self.failure_counts[worker_id] = 0
+                        if health and "gpu_info" in health:
+                            self.workers[worker_id]["gpu_info"] = health["gpu_info"]
+                        continue
+                    self.failure_counts[worker_id] = self.failure_counts.get(worker_id, 0) + 1
+                    failures = self.failure_counts[worker_id]
+                    if failures >= self.max_failures:
+                        logger.warning(
+                            "Worker %s unhealthy (%s/%s). Unregistering.",
+                            worker_id,
+                            failures,
+                            self.max_failures,
+                        )
+                        self._unregister_worker_locked(worker_id)
+
+
+def _filter_request_headers(headers: Dict) -> Dict:
+    return {k: v for k, v in headers.items() if k.lower() not in ["host", "content-length"]}
+
+
+def _filter_response_headers(headers: httpx.Headers) -> Dict:
+    filtered = {}
+    for k, v in headers.items():
+        if k.lower() in ["content-length", "transfer-encoding", "connection"]:
+            continue
+        filtered[k] = v
+    return filtered
+
+
+fastapi_app = FastAPI(title="LLM Router+Manager (Ray Serve)")
+_MAX_ONGOING = int(os.getenv("SERVE_MAX_ONGOING_REQUESTS", "100"))
+
+
+@serve.deployment(max_ongoing_requests=_MAX_ONGOING)
+@serve.ingress(fastapi_app)
+class RouterManagerServe:
+    def __init__(self, registry_handle):
+        self.registry = registry_handle
+        self.request_timeout = float(os.getenv("ROUTER_REQUEST_TIMEOUT", "300"))
+
+    @fastapi_app.get("/health")
+    async def health(self):
+        return await self.registry.health.remote()
+
+    @fastapi_app.post("/v1/chat/completions")
+    async def chat_completions(self, request: Request):
+        body = await request.json()
+        model = body.get("model")
+        if not model:
+            raise HTTPException(status_code=400, detail="model is required")
+
+        routing = await self.registry.select_instance_for_request.remote(model)
+        if not routing:
+            raise HTTPException(status_code=404, detail=f"Model {model} not found")
+
+        target_url = f"{routing['worker_url']}/proxy/{routing['instance_alias']}/v1/chat/completions"
+        headers = _filter_request_headers(dict(request.headers))
+        is_stream = body.get("stream", False)
+
+        try:
+            if is_stream:
+                client = httpx.AsyncClient(timeout=self.request_timeout)
+                request = client.build_request(
+                    "POST",
+                    target_url,
+                    json=body,
+                    headers=headers,
+                )
+                response = await client.send(request, stream=True)
+                if response.status_code >= 400:
+                    detail = await response.aread()
+                    await response.aclose()
+                    await client.aclose()
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=detail.decode("utf-8", errors="ignore"),
+                    )
+
+                async def stream_generator():
+                    try:
+                        async for chunk in response.aiter_bytes():
+                            yield chunk
+                    except asyncio.CancelledError:
+                        logger.info("Client disconnected during stream")
+                    except Exception as exc:
+                        logger.warning("Upstream stream interrupted: %s", exc)
+                    finally:
+                        await response.aclose()
+                        await client.aclose()
+
+                return StreamingResponse(
+                    stream_generator(),
+                    status_code=response.status_code,
+                    media_type="text/event-stream",
+                    headers=_filter_response_headers(response.headers),
+                )
+
+            async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+                response = await client.post(target_url, json=body, headers=headers)
+                if response.headers.get("content-type", "").startswith("application/json"):
+                    return JSONResponse(content=response.json(), status_code=response.status_code)
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    headers=_filter_response_headers(response.headers),
+                )
+        except httpx.TimeoutException:
+            raise HTTPException(status_code=504, detail="Request timed out")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("Error forwarding request: %s", exc)
+            raise HTTPException(status_code=502, detail=f"Error forwarding request: {exc}")
+
+    @fastapi_app.post("/v1/completions")
+    async def completions(self, request: Request):
+        body = await request.json()
+        model = body.get("model")
+        if not model:
+            raise HTTPException(status_code=400, detail="model is required")
+
+        routing = await self.registry.select_instance_for_request.remote(model)
+        if not routing:
+            raise HTTPException(status_code=404, detail=f"Model {model} not found")
+
+        target_url = f"{routing['worker_url']}/proxy/{routing['instance_alias']}/v1/completions"
+        headers = _filter_request_headers(dict(request.headers))
+
+        async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+            try:
+                response = await client.post(target_url, json=body, headers=headers)
+                if response.headers.get("content-type", "").startswith("application/json"):
+                    return JSONResponse(content=response.json(), status_code=response.status_code)
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    headers=_filter_response_headers(response.headers),
+                )
+            except httpx.TimeoutException:
+                raise HTTPException(status_code=504, detail="Request timed out")
+            except Exception as exc:
+                logger.error("Error forwarding request: %s", exc)
+                raise HTTPException(status_code=502, detail=f"Error forwarding request: {exc}")
+
+    @fastapi_app.get("/v1/models")
+    async def list_models(self):
+        result = await self.registry.list_models.remote()
+        routes = result.get("models", [])
+        data = []
+        for route in routes:
+            instances = route.get("instances", [])
+            created_at = None
+            owned_by = "external"
+            if instances:
+                created_at = instances[0].get("created_at")
+                owned_by = instances[0].get("worker_id", owned_by)
+            created = int(created_at) if created_at else int(time.time())
+            data.append(
+                {
+                    "id": route.get("alias"),
+                    "object": "model",
+                    "created": created,
+                    "owned_by": owned_by,
+                }
+            )
+        return {"object": "list", "data": data}
+
+    @fastapi_app.post("/admin/models/register")
+    async def admin_register_model(self, request: Request):
+        body = await request.json()
+        return await self.registry.register_model.remote(
+            alias=body.get("alias"),
+            model_name=body.get("model_name"),
+            model_path=body.get("model_path"),
+            gpu_memory_utilization=body.get("gpu_memory_utilization", 0.9),
+            max_model_len=body.get("max_model_len"),
+            tensor_parallel_size=body.get("tensor_parallel_size", 1),
+            worker_id=body.get("worker_id"),
+            fake=body.get("fake"),
+            fake_response=body.get("fake_response"),
+            fake_delay=body.get("fake_delay"),
+            fake_delay_ms=body.get("fake_delay_ms"),
+            fake_capacity=body.get("fake_capacity"),
+        )
+
+    @fastapi_app.delete("/admin/models/{alias}")
+    async def admin_unregister_model(self, alias: str):
+        return await self.registry.unregister_model.remote(alias)
+
+    @fastapi_app.get("/admin/models")
+    async def admin_list_models(self):
+        return await self.registry.list_models.remote()
+
+    @fastapi_app.get("/admin/workers")
+    async def admin_list_workers(self):
+        return await self.registry.list_workers.remote()
+
+    @fastapi_app.get("/admin/status")
+    async def admin_status(self):
+        return {
+            "health": await self.registry.health.remote(),
+            "models": await self.registry.list_models.remote(),
+            "workers": await self.registry.list_workers.remote(),
+        }
+
+    # Backwards-compatible endpoints
+    @fastapi_app.post("/v1/models/register")
+    async def legacy_register_model(self, request: Request):
+        body = await request.json()
+        return await self.registry.register_model.remote(
+            alias=body.get("alias"),
+            model_name=body.get("model_name"),
+            model_path=body.get("model_path"),
+            gpu_memory_utilization=body.get("gpu_memory_utilization", 0.9),
+            max_model_len=body.get("max_model_len"),
+            tensor_parallel_size=body.get("tensor_parallel_size", 1),
+            worker_id=body.get("worker_id"),
+            fake=body.get("fake"),
+            fake_response=body.get("fake_response"),
+            fake_delay=body.get("fake_delay"),
+            fake_delay_ms=body.get("fake_delay_ms"),
+            fake_capacity=body.get("fake_capacity"),
+        )
+
+    @fastapi_app.delete("/v1/models/{alias}")
+    async def legacy_unregister_model(self, alias: str):
+        return await self.registry.unregister_model.remote(alias)
+
+    @fastapi_app.get("/workers")
+    async def list_workers(self):
+        return await self.registry.list_workers.remote()
+
+    @fastapi_app.post("/workers/register")
+    async def register_worker(self, request: Request):
+        body = await request.json()
+        return await self.registry.register_worker.remote(
+            worker_id=body.get("worker_id"),
+            worker_url=body.get("worker_url"),
+            public_worker_url=body.get("public_worker_url"),
+            gpu_info=body.get("gpu_info"),
+        )
+
+    @fastapi_app.delete("/workers/{worker_id}/unregister")
+    async def unregister_worker(self, worker_id: str):
+        return await self.registry.unregister_worker.remote(worker_id)
+
+
+def _init_ray():
+    if ray.is_initialized():
+        return
+    address = os.getenv("RAY_ADDRESS")
+    working_dir = os.getenv("RAY_WORKING_DIR")
+    if working_dir is None:
+        working_dir = str(Path(__file__).resolve().parents[2])
+    runtime_env = None
+    if working_dir and working_dir.lower() != "none":
+        runtime_env = {"working_dir": working_dir}
+
+    if address:
+        ray.init(address=address, runtime_env=runtime_env)
+    else:
+        ray.init(runtime_env=runtime_env)
+
+
+def main():
+    serve_host = os.getenv("SERVE_HOST", os.getenv("ROUTER_HOST", "0.0.0.0"))
+    serve_port = int(os.getenv("SERVE_PORT", os.getenv("ROUTER_PORT", "8000")))
+
+    _init_ray()
+
+    try:
+        serve.start(http_options={"host": serve_host, "port": serve_port})
+    except Exception as exc:
+        if "already" not in str(exc).lower():
+            raise
+        logger.info("Ray Serve already started: %s", exc)
+
+    healthcheck_interval = float(os.getenv("WORKER_HEALTHCHECK_INTERVAL", "15"))
+    healthcheck_timeout = float(os.getenv("WORKER_HEALTHCHECK_TIMEOUT", "3"))
+    max_failures = int(os.getenv("WORKER_HEALTHCHECK_MAX_FAILURES", "3"))
+    load_high = float(os.getenv("MODEL_LOAD_HIGH", "0.7"))
+    load_low = float(os.getenv("MODEL_LOAD_LOW", "0.3"))
+    instance_capacity = int(os.getenv("MODEL_INSTANCE_CAPACITY", "4"))
+    min_replicas = int(os.getenv("MODEL_MIN_REPLICAS", "1"))
+    max_replicas = int(os.getenv("MODEL_MAX_REPLICAS", "8"))
+    scale_interval = float(os.getenv("MODEL_SCALE_INTERVAL", "10"))
+
+    try:
+        registry = ray.get_actor("worker_registry")
+    except ValueError:
+        registry = WorkerRegistryActor.options(name="worker_registry", lifetime="detached").remote(
+            healthcheck_interval=healthcheck_interval,
+            healthcheck_timeout=healthcheck_timeout,
+            max_failures=max_failures,
+            load_high=load_high,
+            load_low=load_low,
+            instance_capacity=instance_capacity,
+            min_replicas=min_replicas,
+            max_replicas=max_replicas,
+            scale_interval=scale_interval,
+        )
+    serve.run(RouterManagerServe.bind(registry), route_prefix="/")
+
+    logger.info("Ray Serve running on %s:%s", serve_host, serve_port)
+
+
+if __name__ == "__main__":
+    main()

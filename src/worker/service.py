@@ -49,14 +49,12 @@ class WorkerService:
         listen_host: str = "0.0.0.0",
         listen_port: int = 7000,
         manager_url: Optional[str] = None,
-        heartbeat_interval: int = 30,
         public_url: Optional[str] = None
     ):
         self.worker_id = worker_id
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.manager_url = manager_url
-        self.heartbeat_interval = heartbeat_interval
         self.public_url = public_url  # 公网访问 URL
         
         # vLLM 实例管理器
@@ -69,8 +67,7 @@ class WorkerService:
         self.app = FastAPI(title=f"Worker Service - {worker_id}")
         self._setup_routes()
         
-        # 心跳任务
-        self._heartbeat_task: Optional[asyncio.Task] = None
+        # 已废弃心跳机制（保留注册/注销）
     
     def _setup_routes(self):
         """设置 API 路由"""
@@ -122,14 +119,31 @@ class WorkerService:
                         detail="alias and model_name are required"
                     )
                 
-                instance = await self.vllm_manager.start_instance(
-                    alias=alias,
-                    model_name=model_name,
-                    model_path=body.get("model_path"),
-                    gpu_memory_utilization=body.get("gpu_memory_utilization", 0.9),
-                    max_model_len=body.get("max_model_len"),
-                    tensor_parallel_size=body.get("tensor_parallel_size", 1)
-                )
+                is_fake = model_name in {"__fake__", "fake", "mock", "dummy"} or str(model_name).startswith("fake:")
+                if body.get("fake", False):
+                    is_fake = True
+
+                if is_fake:
+                    fake_response = body.get("fake_response", "FAKE_RESPONSE")
+                    fake_delay = body.get("fake_delay", None)
+                    fake_delay_ms = body.get("fake_delay_ms", 500)
+                    delay_s = float(fake_delay) if fake_delay is not None else float(fake_delay_ms) / 1000.0
+                    fake_capacity = int(body.get("fake_capacity", 1))
+                    instance = await self.vllm_manager.start_fake_instance(
+                        alias=alias,
+                        response=fake_response,
+                        delay_s=delay_s,
+                        capacity=fake_capacity,
+                    )
+                else:
+                    instance = await self.vllm_manager.start_instance(
+                        alias=alias,
+                        model_name=model_name,
+                        model_path=body.get("model_path"),
+                        gpu_memory_utilization=body.get("gpu_memory_utilization", 0.9),
+                        max_model_len=body.get("max_model_len"),
+                        tensor_parallel_size=body.get("tensor_parallel_size", 1)
+                    )
                 
                 return {
                     "status": "success",
@@ -171,17 +185,152 @@ class WorkerService:
         
         @self.app.get("/instances/{alias}/status")
         async def get_instance_status(alias: str):
-            """获取实例状态（供 Manager 查询）"""
-            instance = self.vllm_manager.get_instance(alias)
-            if instance:
-                return {
-                    "alias": alias,
-                    "status": instance.status.value,
-                    "ready": instance.status == InstanceStatus.RUNNING,
-                    "model_name": instance.model_name
-                }
+            """获取实例详细状态（包括睡眠级别）"""
+            status = self.vllm_manager.get_instance_status(alias)
+            if status:
+                status["gpu_info"] = get_gpu_info().to_dict()
+                return status
             else:
                 raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
+        
+        @self.app.post("/instances/{alias}/sleep")
+        async def set_sleep_level(alias: str, request: Request):
+            """设置实例的睡眠级别
+            
+            请求体：
+            {
+                "level": 0,  # 0=ACTIVE, 1=SLEEP_1, 2=SLEEP_2, 3=UNLOADED
+                "level_name": "SLEEP_1"  # 可选，使用名称
+            }
+            """
+            try:
+                body = await request.json()
+                
+                # 支持数字或名称
+                if "level_name" in body:
+                    from src.worker.vllm_manager import SleepLevel
+                    level_name = body["level_name"].upper()
+                    try:
+                        level = SleepLevel[level_name]
+                    except KeyError:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Invalid level_name: {level_name}. Must be one of: ACTIVE, SLEEP_1, SLEEP_2, UNLOADED"
+                        )
+                elif "level" in body:
+                    from src.worker.vllm_manager import SleepLevel
+                    level_value = body["level"]
+                    try:
+                        level = SleepLevel(level_value)
+                    except ValueError:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Invalid level: {level_value}. Must be 0-3"
+                        )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Must provide 'level' (0-3) or 'level_name' (ACTIVE/SLEEP_1/SLEEP_2/UNLOADED)"
+                    )
+                
+                success = await self.vllm_manager.set_sleep_level(alias, level)
+                
+                if success:
+                    return {
+                        "status": "success",
+                        "message": f"Instance {alias} set to {level.name}",
+                        "level": level.value,
+                        "level_name": level.name
+                    }
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to set sleep level for {alias}"
+                    )
+                    
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Error setting sleep level for {alias}: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @self.app.post("/instances/{alias}/wake")
+        async def wake_instance(alias: str):
+            """唤醒实例到激活状态"""
+            from src.worker.vllm_manager import SleepLevel
+            
+            try:
+                success = await self.vllm_manager.set_sleep_level(alias, SleepLevel.ACTIVE)
+                
+                if success:
+                    return {
+                        "status": "success",
+                        "message": f"Instance {alias} woken up"
+                    }
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to wake up {alias}"
+                    )
+            except Exception as e:
+                logger.error(f"Error waking up {alias}: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @self.app.post("/sleep/config")
+        async def configure_auto_sleep(request: Request):
+            """配置自动睡眠参数
+            
+            请求体：
+            {
+                "enable": true,
+                "sleep_1_timeout": 300,
+                "sleep_2_timeout": 900,
+                "unload_timeout": 1800
+            }
+            """
+            try:
+                body = await request.json()
+                
+                if "enable" in body:
+                    self.vllm_manager.enable_auto_sleep = body["enable"]
+                
+                if "sleep_1_timeout" in body:
+                    self.vllm_manager.sleep_1_timeout = body["sleep_1_timeout"]
+                
+                if "sleep_2_timeout" in body:
+                    self.vllm_manager.sleep_2_timeout = body["sleep_2_timeout"]
+                
+                if "unload_timeout" in body:
+                    self.vllm_manager.unload_timeout = body["unload_timeout"]
+                
+                return {
+                    "status": "success",
+                    "config": {
+                        "enable_auto_sleep": self.vllm_manager.enable_auto_sleep,
+                        "sleep_1_timeout": self.vllm_manager.sleep_1_timeout,
+                        "sleep_2_timeout": self.vllm_manager.sleep_2_timeout,
+                        "unload_timeout": self.vllm_manager.unload_timeout
+                    }
+                }
+                
+            except Exception as e:
+                logger.error(f"Error configuring auto-sleep: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @self.app.get("/sleep/config")
+        async def get_sleep_config():
+            instance = self.vllm_manager.get_instance(alias)
+            if not instance:
+                raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
+            else:
+                """获取当前的自动睡眠配置"""
+                return {
+                    "enable_auto_sleep": self.vllm_manager.enable_auto_sleep,
+                    "sleep_1_timeout": self.vllm_manager.sleep_1_timeout,
+                    "sleep_2_timeout": self.vllm_manager.sleep_2_timeout,
+                    "unload_timeout": self.vllm_manager.unload_timeout,
+                }
+
         
         @self.app.post("/proxy/{alias}/v1/chat/completions")
         async def chat_completions(alias: str, request: ChatCompletionRequest):
@@ -369,34 +518,6 @@ class WorkerService:
             except Exception as e:
                 logger.error(f"Error registering to manager: {e}")
     
-    async def send_heartbeat(self):
-        """发送心跳到 Manager"""
-        if not self.manager_url:
-            return
-        
-        heartbeat_url = f"{self.manager_url}/workers/{self.worker_id}/heartbeat"
-        
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            try:
-                instances_data = {
-                    alias: instance.to_dict()
-                    for alias, instance in self.vllm_manager.list_instances().items()
-                }
-                
-                response = await client.post(
-                    heartbeat_url,
-                    json={
-                        "gpu_info": self.gpu_info.to_dict(),
-                        "instances": instances_data
-                    }
-                )
-                
-                if response.status_code != 200:
-                    logger.warning(f"Heartbeat failed: {response.status_code}")
-                    
-            except Exception as e:
-                logger.error(f"Error sending heartbeat: {e}")
-    
     async def unregister_from_manager(self):
         """从 Manager 注销"""
         if not self.manager_url:
@@ -418,6 +539,9 @@ class WorkerService:
         """清理资源"""
         logger.info("Cleaning up Worker resources...")
         
+        # 停止睡眠监控任务
+        await self.vllm_manager.stop_sleep_monitor()
+        
         # 停止所有 vLLM 实例
         for alias in list(self.vllm_manager.instances.keys()):
             try:
@@ -429,36 +553,16 @@ class WorkerService:
         # 从 Manager 注销
         await self.unregister_from_manager()
         
-        # 取消心跳任务
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-    
-    async def _heartbeat_loop(self):
-        """心跳循环"""
-        # 首次注册
-        await self.register_to_manager()
-        
-        # 定期发送心跳
-        while True:
-            await asyncio.sleep(self.heartbeat_interval)
-            await self.send_heartbeat()
-    
-    async def start_heartbeat(self):
-        """启动心跳任务"""
-        if self._heartbeat_task is None or self._heartbeat_task.done():
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            logger.info("Heartbeat task started")
+        # 无心跳任务需要取消
     
     def run(self):
         """运行 Worker 服务"""
         # 注册启动和关闭事件
         @self.app.on_event("startup")
         async def on_startup():
-            await self.start_heartbeat()
+            await self.register_to_manager()
+            # 启动睡眠监控任务
+            await self.vllm_manager.start_sleep_monitor()
             logger.info(f"Worker Service started: {self.worker_id}")
         
         @self.app.on_event("shutdown")

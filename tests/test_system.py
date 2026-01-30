@@ -1,8 +1,14 @@
-"""测试脚本 - 验证系统功能"""
+"""测试脚本 - 验证系统功能（Ray Serve 版本）"""
 import asyncio
-import httpx
-import time
+import base64
+import io
 import json
+import os
+import time
+from pathlib import Path
+
+import httpx
+from PIL import Image
 
 
 class SystemTester:
@@ -10,32 +16,125 @@ class SystemTester:
     
     def __init__(
         self,
-        router_url: str = "http://localhost:8000",
-        manager_url: str = "http://localhost:9000",
-        worker_url: str = "http://localhost:7000"
+        serve_url: str = "http://localhost:8000",
+        worker_url: str = "http://localhost:7000",
+        model_alias: str = "test-model",
+        model_name: str = "Qwen/Qwen3-VL-2B-Instruct",
     ):
-        self.router_url = router_url
-        self.manager_url = manager_url
+        self.serve_url = serve_url
         self.worker_url = worker_url
+        self.model_alias = model_alias
+        self.model_name = model_name
+
+    def _repo_root(self) -> Path:
+        return Path(__file__).resolve().parents[1]
+
+    def _load_image_data_uri(self) -> str:
+        root = self._repo_root()
+        candidates = [
+            root / "demo.png",
+            root / "demo2.jpg",
+            root / "demo.jpg",
+        ]
+        for path in candidates:
+            if path.exists():
+                data = path.read_bytes()
+                mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+                encoded = base64.b64encode(data).decode("ascii")
+                return f"data:{mime};base64,{encoded}"
+
+        image = Image.new("RGB", (256, 256), color=(64, 128, 192))
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        data = buf.getvalue()
+        encoded = base64.b64encode(data).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+
+    async def _wait_instance_running(self, alias: str, timeout_s: int = 600) -> bool:
+        deadline = time.time() + timeout_s
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            while time.time() < deadline:
+                try:
+                    response = await client.get(f"{self.worker_url}/instances/{alias}/status")
+                    if response.status_code == 200:
+                        status = response.json().get("status")
+                        if status == "running":
+                            return True
+                except Exception:
+                    pass
+                await asyncio.sleep(5)
+        return False
+
+    async def _stream_first_token(self, payload: dict, timeout_s: int = 600):
+        start = time.perf_counter()
+        first_token_latency = None
+        content = []
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s)) as client:
+            async with client.stream(
+                "POST",
+                f"{self.serve_url}/v1/chat/completions",
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                try:
+                    async for line in response.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        chunk = json.loads(data)
+                        delta = chunk["choices"][0].get("delta", {})
+                        text = delta.get("content")
+                        if text:
+                            content.append(text)
+                            if first_token_latency is None:
+                                first_token_latency = time.perf_counter() - start
+                except httpx.RemoteProtocolError as exc:
+                    if first_token_latency is None:
+                        raise
+                    print(f"⚠️ 流式连接被提前关闭: {exc}")
+        return first_token_latency, "".join(content)
+
+    async def _single_token_latency(self, payload: dict, timeout_s: int = 600):
+        start = time.perf_counter()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s)) as client:
+            response = await client.post(
+                f"{self.serve_url}/v1/chat/completions",
+                json=payload,
+            )
+            response.raise_for_status()
+            latency = time.perf_counter() - start
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+        return latency, content
+
+    async def _wait_sleep_level(self, alias: str, target_level: int, timeout_s: int = 300) -> bool:
+        deadline = time.time() + timeout_s
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            while time.time() < deadline:
+                try:
+                    response = await client.get(f"{self.worker_url}/instances/{alias}/status")
+                    if response.status_code == 200:
+                        status = response.json()
+                        if status.get("sleep_level_value") == target_level:
+                            return True
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+        return False
     
     async def test_health_checks(self):
         """测试健康检查"""
         print("\n=== 测试健康检查 ===")
         
         async with httpx.AsyncClient() as client:
-            # 测试 Router
+            # 测试 Serve
             try:
-                response = await client.get(f"{self.router_url}/health")
-                print(f"✓ Router 健康: {response.json()}")
+                response = await client.get(f"{self.serve_url}/health")
+                print(f"✓ Serve 健康: {response.json()}")
             except Exception as e:
-                print(f"✗ Router 不可用: {e}")
-            
-            # 测试 Manager
-            try:
-                response = await client.get(f"{self.manager_url}/health")
-                print(f"✓ Manager 健康: {response.json()}")
-            except Exception as e:
-                print(f"✗ Manager 不可用: {e}")
+                print(f"✗ Serve 不可用: {e}")
             
             # 测试 Worker
             try:
@@ -50,22 +149,24 @@ class SystemTester:
         
         async with httpx.AsyncClient() as client:
             try:
-                response = await client.get(f"{self.manager_url}/workers")
+                response = await client.get(f"{self.serve_url}/workers")
                 workers = response.json()
                 print(f"已注册 Worker 数量: {len(workers['workers'])}")
                 for worker in workers['workers']:
-                    print(f"  - {worker['worker_id']}: {worker['status']}")
+                    print(f"  - {worker['worker_id']}")
             except Exception as e:
                 print(f"✗ 获取 Worker 列表失败: {e}")
     
-    async def test_model_registration(self, alias: str = "test-model", model_name: str = "facebook/opt-125m"):
+    async def test_model_registration(self, alias: str = None, model_name: str = None):
         """测试模型注册"""
+        alias = alias or self.model_alias
+        model_name = model_name or self.model_name
         print(f"\n=== 测试模型注册: {alias} ===")
         
         async with httpx.AsyncClient(timeout=120.0) as client:
             try:
                 response = await client.post(
-                    f"{self.router_url}/admin/models/register",
+                    f"{self.serve_url}/admin/models/register",
                     json={
                         "alias": alias,
                         "model_name": model_name,
@@ -86,7 +187,7 @@ class SystemTester:
         
         async with httpx.AsyncClient() as client:
             try:
-                response = await client.get(f"{self.router_url}/v1/models")
+                response = await client.get(f"{self.serve_url}/v1/models")
                 models = response.json()
                 print(f"可用模型数量: {len(models['data'])}")
                 for model in models['data']:
@@ -94,28 +195,26 @@ class SystemTester:
             except Exception as e:
                 print(f"✗ 列出模型失败: {e}")
     
-    async def test_chat_completion(self, model: str = "test-model"):
+    async def test_chat_completion(self, model: str = None, ensure_registered: bool = True):
         """测试对话补全"""
+        model = model or self.model_alias
         print(f"\n=== 测试对话补全: {model} ===")
         
         async with httpx.AsyncClient(timeout=60.0) as client:
             try:
-                # 等待模型启动
-                print("等待模型启动...")
-                for i in range(30):
-                    try:
-                        response = await client.get(f"{self.manager_url}/models/{model}")
-                        if response.status_code == 200:
-                            break
-                    except:
-                        pass
-                    await asyncio.sleep(10)
-                    print(f"  等待中... ({i+1}/30)")
+                if ensure_registered:
+                    await self.test_model_registration(alias=model)
+                # 等待模型就绪
+                print("等待模型就绪...")
+                ready = await self._wait_instance_running(model, timeout_s=600)
+                if not ready:
+                    print("✗ 模型未在超时内就绪")
+                    return False
                 
                 # 发送请求
                 print("发送推理请求...")
                 response = await client.post(
-                    f"{self.router_url}/v1/chat/completions",
+                    f"{self.serve_url}/v1/chat/completions",
                     json={
                         "model": model,
                         "messages": [
@@ -141,13 +240,342 @@ class SystemTester:
         
         async with httpx.AsyncClient() as client:
             try:
-                response = await client.get(f"{self.router_url}/admin/status")
+                response = await client.get(f"{self.serve_url}/admin/status")
                 status = response.json()
-                print(f"Manager 状态: {status['manager']}")
+                print(f"Serve 状态: {status['health']}")
                 print(f"模型数量: {len(status['models']['models'])}")
                 print(f"Worker 数量: {len(status['workers']['workers'])}")
             except Exception as e:
                 print(f"✗ 获取系统状态失败: {e}")
+
+    async def test_multimodal_single_image(self, model: str = None):
+        model = model or self.model_alias
+        print(f"\n=== 测试单图像多模态: {model} ===")
+        image_data = self._load_image_data_uri()
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "请描述这张图片的主要内容。"},
+                        {"type": "image_url", "image_url": {"url": image_data}},
+                    ],
+                }
+            ],
+            "max_tokens": 64,
+        }
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            try:
+                response = await client.post(f"{self.serve_url}/v1/chat/completions", json=payload)
+                response.raise_for_status()
+                result = response.json()
+                print("✓ 单图像请求成功")
+                print(f"  响应: {result['choices'][0]['message']['content']}")
+                return True
+            except Exception as e:
+                print(f"✗ 单图像请求失败: {e}")
+                return False
+
+    async def test_multimodal_image_list(self, model: str = None, frames: int = 4):
+        model = model or self.model_alias
+        print(f"\n=== 测试多帧图像列表: {model} ===")
+        image_data = self._load_image_data_uri()
+        content = [{"type": "text", "text": "以下是视频抽帧，请总结主要变化。"}]
+        for _ in range(frames):
+            content.append({"type": "image_url", "image_url": {"url": image_data}})
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 80,
+        }
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            try:
+                response = await client.post(f"{self.serve_url}/v1/chat/completions", json=payload)
+                response.raise_for_status()
+                result = response.json()
+                print("✓ 多帧图像请求成功")
+                print(f"  响应: {result['choices'][0]['message']['content']}")
+                return True
+            except Exception as e:
+                print(f"✗ 多帧图像请求失败: {e}")
+                return False
+
+    async def test_streaming_chat(self, model: str = None, ensure_registered: bool = True):
+        model = model or self.model_alias
+        print(f"\n=== 测试流式输出: {model} ===")
+        if ensure_registered:
+            await self.test_model_registration(alias=model)
+        ready = await self._wait_instance_running(model, timeout_s=600)
+        if not ready:
+            print("✗ 模型未在超时内就绪，跳过流式测试")
+            return False
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            await client.post(f"{self.worker_url}/instances/{model}/wake")
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "用一句话介绍你自己。"}],
+            "max_tokens": 64,
+            "stream": True,
+        }
+        try:
+            first_latency, content = await self._stream_first_token(payload, timeout_s=600)
+            print("✓ 流式输出成功")
+            if first_latency is not None:
+                print(f"  首字符延迟: {first_latency:.3f}s")
+            print(f"  响应: {content}")
+            return True
+        except Exception as e:
+            print(f"✗ 流式输出失败: {e}")
+            return False
+
+    async def test_sleep_mode_latency(self, model: str = None, ensure_registered: bool = True):
+        model = model or self.model_alias
+        print(f"\n=== 测试休眠模式首字符延迟: {model} ===")
+        if ensure_registered:
+            await self.test_model_registration(alias=model)
+        ready = await self._wait_instance_running(model, timeout_s=600)
+        if not ready:
+            print("✗ 模型未在超时内就绪，跳过休眠测试")
+            return False
+        levels = [
+            ("ACTIVE", 0),
+            ("SLEEP_1", 1),
+            ("SLEEP_2", 2),
+            ("UNLOADED", 3),
+        ]
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for name, level in levels:
+                try:
+                    if level == 0:
+                        await client.post(f"{self.worker_url}/instances/{model}/wake")
+                    else:
+                        await client.post(
+                            f"{self.worker_url}/instances/{model}/sleep",
+                            json={"level": level},
+                        )
+                    ready_level = await self._wait_sleep_level(model, level, timeout_s=300)
+                    if not ready_level:
+                        print(f"✗ {name} 休眠级别未在超时内就绪，跳过")
+                        continue
+                    payload = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": "请输出一句话。"}],
+                        "max_tokens": 1,
+                        "stream": False,
+                    }
+                    latency, _ = await self._single_token_latency(payload, timeout_s=600)
+                    if latency is None:
+                        print(f"✗ {name} 首字符延迟获取失败")
+                    else:
+                        print(f"✓ {name} 首字符延迟: {latency:.3f}s")
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    print(f"✗ {name} 测试失败: {e}")
+
+    async def test_autoscale_fake_model(self):
+        """测试自动扩容逻辑（假模型）"""
+        print("\n=== 测试自动扩容（假模型） ===")
+        alias = "fake-model"
+        payload = {
+            "alias": alias,
+            "model_name": "__fake__",
+            "fake": True,
+            "fake_response": "FAKE_OK",
+            "fake_delay_ms": 3000,
+            "fake_capacity": 1,
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(f"{self.serve_url}/admin/models/register", json=payload)
+            if response.status_code >= 400:
+                print(f"✗ 假模型注册失败: {response.text}")
+                return False
+            result = response.json()
+            if result.get("status") not in {"success", "exists"}:
+                print(f"✗ 假模型注册失败: {result}")
+                return False
+
+        # 等待模型注册生效
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for _ in range(10):
+                models = await client.get(f"{self.serve_url}/admin/models")
+                data = models.json().get("models", [])
+                if any(m.get("alias") == alias for m in data):
+                    break
+                await asyncio.sleep(1)
+
+        async def _send_fake():
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(
+                    f"{self.serve_url}/v1/chat/completions",
+                    json={
+                        "model": alias,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 4,
+                    },
+                )
+                resp.raise_for_status()
+
+        tasks = [asyncio.create_task(_send_fake()) for _ in range(6)]
+        await asyncio.sleep(2)
+
+        # 等待 autoscaler 触发扩容
+        await asyncio.sleep(15)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            models = await client.get(f"{self.serve_url}/admin/models")
+            data = models.json().get("models", [])
+            target = next((m for m in data if m.get("alias") == alias), None)
+            if not target:
+                print("✗ 未找到假模型记录")
+                return False
+            instances = target.get("instances", [])
+            print(f"当前实例数: {len(instances)}")
+            if len(instances) < 2:
+                print("✗ 未触发扩容")
+                return False
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        print("✓ 自动扩容测试通过")
+        return True
+
+    async def test_autoscale_real_model(self):
+        """测试自动扩容逻辑（真模型，逐步增加并发）"""
+        print("\n=== 测试自动扩容（真模型） ===")
+        alias = "qwen3-vl-2b-test"
+        model_name = "Qwen/Qwen3-VL-2B-Instruct"
+        gpu_util = float(os.getenv("REAL_MODEL_GPU_UTIL", "0.5"))
+        max_model_len = int(os.getenv("REAL_MODEL_MAX_LEN", "2048"))
+        instance_capacity = int(os.getenv("MODEL_INSTANCE_CAPACITY", "4"))
+        max_concurrency = int(os.getenv("REAL_MODEL_MAX_CONCURRENCY", "8"))
+        step = int(os.getenv("REAL_MODEL_CONCURRENCY_STEP", "2"))
+        hold_seconds = int(os.getenv("REAL_MODEL_HOLD_SECONDS", "20"))
+        scale_down_wait = int(os.getenv("REAL_MODEL_SCALE_DOWN_WAIT", "60"))
+
+        # 注册模型（限制显存占用）
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{self.serve_url}/admin/models/register",
+                json={
+                    "alias": alias,
+                    "model_name": model_name,
+                    "gpu_memory_utilization": gpu_util,
+                    "max_model_len": max_model_len,
+                },
+            )
+            if response.status_code >= 400:
+                print(f"✗ 真模型注册失败: {response.text}")
+                return False
+            result = response.json()
+            if result.get("status") not in {"success", "exists"}:
+                print(f"✗ 真模型注册失败: {result}")
+                return False
+
+        ready = await self._wait_instance_running(alias, timeout_s=1200)
+        if not ready:
+            print("✗ 真模型未在超时内就绪")
+            return False
+
+        stop_event = asyncio.Event()
+
+        async def _send_loop():
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                while not stop_event.is_set():
+                    resp = await client.post(
+                        f"{self.serve_url}/v1/chat/completions",
+                        json={
+                            "model": alias,
+                            "messages": [{"role": "user", "content": "Hi"}],
+                            "max_tokens": 8,
+                        },
+                    )
+                    if resp.status_code >= 400:
+                        break
+
+        tasks: list[asyncio.Task] = []
+
+        async def _get_instances():
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                models = await client.get(f"{self.serve_url}/admin/models")
+                data = models.json().get("models", [])
+                return next((m for m in data if m.get("alias") == alias), None)
+
+        async def _avg_load():
+            model_entry = await _get_instances()
+            if not model_entry:
+                return 0.0, []
+            instances = model_entry.get("instances", [])
+            loads = []
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                for inst in instances:
+                    inst_alias = inst.get("instance_alias")
+                    if not inst_alias:
+                        continue
+                    status = await client.get(f"{self.worker_url}/instances/{inst_alias}/status")
+                    if status.status_code != 200:
+                        continue
+                    info = status.json()
+                    inflight = int(info.get("inflight_requests", 0))
+                    capacity = int(info.get("capacity") or instance_capacity)
+                    load = min(inflight / max(1, capacity), 1.0)
+                    loads.append((inst_alias, load, info.get("sleep_level_value", 0)))
+            if not loads:
+                return 0.0, []
+            avg = sum(item[1] for item in loads) / len(loads)
+            return avg, loads
+
+        # 逐步增加并发，直到平均负载 > 0.8
+        target_load = 0.8
+        current = 0
+        while current < max_concurrency:
+            add = min(step, max_concurrency - current)
+            for _ in range(add):
+                tasks.append(asyncio.create_task(_send_loop()))
+            current += add
+            await asyncio.sleep(5)
+            avg_load, loads = await _avg_load()
+            print(f"当前并发: {current}, 平均负载: {avg_load:.2f}, 详情: {loads}")
+            if avg_load >= target_load:
+                print("达到阈值，维持负载...")
+                break
+
+        # 维持负载一段时间，等待扩容
+        await asyncio.sleep(hold_seconds)
+        model_entry = await _get_instances()
+        if not model_entry:
+            print("✗ 未找到真模型记录")
+            stop_event.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            return False
+
+        instances = model_entry.get("instances", [])
+        print(f"扩容后实例数: {len(instances)}")
+
+        # 停止压测，观察是否休眠
+        stop_event.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        await asyncio.sleep(scale_down_wait)
+        model_entry = await _get_instances()
+        instances = model_entry.get("instances", []) if model_entry else []
+        any_sleep = False
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for inst in instances:
+                inst_alias = inst.get("instance_alias")
+                if not inst_alias:
+                    continue
+                status = await client.get(f"{self.worker_url}/instances/{inst_alias}/status")
+                if status.status_code != 200:
+                    continue
+                info = status.json()
+                if info.get("sleep_level_value", 0) > 0:
+                    any_sleep = True
+        if any_sleep:
+            print("✓ 负载降低后实例进入休眠")
+        else:
+            print("⚠️ 未观察到休眠（可能负载仍高或阈值配置较高）")
+
+        return True
     
     async def run_all_tests(self):
         """运行所有测试"""
@@ -162,13 +590,17 @@ class SystemTester:
         await self.test_system_status()
         
         # 功能测试（可选，需要较长时间）
-        # print("\n是否执行完整功能测试（包括模型注册和推理）？")
-        # print("警告：这需要下载模型并启动 vLLM，可能需要几分钟")
-        # response = input("输入 'yes' 继续，其他键跳过: ")
-        # if response.lower() == 'yes':
-        #     await self.test_model_registration()
-        #     await self.test_list_models()
-        #     await self.test_chat_completion()
+        if os.getenv("RUN_FULL_TESTS") == "1":
+            # await self.test_model_registration()
+            # await self.test_list_models()
+            # await self.test_chat_completion(ensure_registered=False)
+            # await self.test_multimodal_single_image()
+            # await self.test_multimodal_image_list()
+            # await self.test_streaming_chat(ensure_registered=False)
+            # await self.test_sleep_mode_latency(ensure_registered=False)
+            await self.test_autoscale_fake_model()
+            if os.getenv("RUN_REAL_AUTOSCALE_TEST") == "1":
+                await self.test_autoscale_real_model()
         
         print("\n" + "=" * 60)
         print("测试完成")
@@ -179,13 +611,11 @@ async def main():
     """主函数"""
     import sys
     
-    router_url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
-    manager_url = sys.argv[2] if len(sys.argv) > 2 else "http://localhost:9000"
-    worker_url = sys.argv[3] if len(sys.argv) > 3 else "http://localhost:7000"
+    serve_url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
+    worker_url = sys.argv[2] if len(sys.argv) > 2 else "http://localhost:7000"
     
     tester = SystemTester(
-        router_url=router_url,
-        manager_url=manager_url,
+        serve_url=serve_url,
         worker_url=worker_url
     )
     

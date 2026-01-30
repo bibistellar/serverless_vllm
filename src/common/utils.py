@@ -16,6 +16,7 @@ def get_gpu_info():
         gpu_names = []
         total_memory = 0.0
         available_memory = 0.0
+        utilization_sum = 0.0
         
         for i in range(gpu_count):
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
@@ -27,15 +28,22 @@ def get_gpu_info():
             mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
             total_memory += mem_info.total / (1024**3)  # 转换为 GB
             available_memory += mem_info.free / (1024**3)
+            util_rates = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            utilization_sum += util_rates.gpu
         
         pynvml.nvmlShutdown()
         
         from src.common.models import GPUInfo
+        utilization = 0.0
+        if gpu_count > 0:
+            utilization = round(utilization_sum / gpu_count / 100.0, 4)
+
         return GPUInfo(
             gpu_count=gpu_count,
             gpu_names=gpu_names,
             total_memory_gb=round(total_memory, 2),
-            available_memory_gb=round(available_memory, 2)
+            available_memory_gb=round(available_memory, 2),
+            utilization=utilization
         )
     except Exception as e:
         logger.error(f"Failed to get GPU info: {e}")
