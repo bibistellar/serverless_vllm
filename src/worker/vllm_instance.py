@@ -29,6 +29,29 @@ from src.common.models import VLLMInstanceInfo, InstanceStatus
 logger = logging.getLogger(__name__)
 
 
+def _silence_vllm_logs() -> None:
+    """Reduce vLLM logger noise; keep only our own logs."""
+    for name in (
+        "vllm",
+        "vllm.engine",
+        "vllm.engine.async_llm_engine",
+        "vllm.model_executor",
+        "vllm.model_executor.driver_worker",
+        "vllm.model_executor.model_loader",
+        "vllm.distributed",
+        "vllm.executor",
+        "vllm.worker",
+        "vllm.utils",
+        "vllm.logger",
+    ):
+        target = logging.getLogger(name)
+        target.setLevel(logging.ERROR)
+        target.propagate = False
+
+
+_silence_vllm_logs()
+
+
 class FakeInstance:
     """Fake model instance for load testing."""
 
@@ -92,6 +115,14 @@ class VLLMManager:
         self._latency_metrics: Dict[str, Dict] = {}
         # alias -> fake instance
         self.fake_instances: Dict[str, FakeInstance] = {}
+        # alias -> pending start config
+        self._start_configs: Dict[str, Dict] = {}
+        # alias -> start task
+        self._start_tasks: Dict[str, asyncio.Task] = {}
+        # alias -> reload task
+        self._reload_tasks: Dict[str, asyncio.Task] = {}
+        # alias -> wake task
+        self._wake_tasks: Dict[str, asyncio.Task] = {}
         
         # 自动睡眠配置
         self.enable_auto_sleep = enable_auto_sleep
@@ -137,9 +168,12 @@ class VLLMManager:
                 current_time = time.time()
                 
                 for alias, instance in list(self.instances.items()):
-                    if instance.status != InstanceStatus.RUNNING:
+                    if instance.status not in {InstanceStatus.RUNNING, InstanceStatus.SLEEPING}:
                         continue
                     
+                    inflight = self._inflight_requests.get(alias, 0)
+                    if inflight > 0:
+                        continue
                     idle_time = current_time - instance.last_used
                     current_level = self.sleep_levels.get(alias, SleepLevel.ACTIVE)
                     
@@ -169,59 +203,49 @@ class VLLMManager:
         model_path: Optional[str] = None,
         gpu_memory_utilization: float = 0.75,
         max_model_len: Optional[int] = 4096,
-        tensor_parallel_size: Optional[int] = None
+        tensor_parallel_size: Optional[int] = None,
+        fake: bool = False,
+        fake_response: Optional[str] = None,
+        fake_delay: Optional[float] = None,
+        fake_delay_ms: Optional[int] = None,
+        fake_capacity: Optional[int] = None,
     ) -> VLLMInstanceInfo:
-        """启动一个新的 vLLM 引擎实例（Qwen3-VL 优化版本）
-        
-        Args:
-            alias: 实例别名
-            model_name: 模型名称（如 Qwen/Qwen3-VL-2B-Instruct）
-            model_path: 模型路径，如果为 None 则使用 model_name
-            gpu_memory_utilization: GPU 内存使用率
-            max_model_len: 最大模型长度
-            tensor_parallel_size: 张量并行大小（默认使用所有 GPU）
-            
-        Returns:
-            VLLMInstanceInfo: 实例信息
-        """
+        """触发 vLLM 实例启动，立即返回 STARTING 状态。"""
         if alias in self.instances:
-            logger.warning(f"Instance {alias} already exists")
-            return self.instances[alias]
+            instance = self.instances[alias]
+            if instance.status == InstanceStatus.ERROR:
+                self._purge_instance(alias)
+                instance.status = InstanceStatus.STARTING
+                if alias not in self._lifecycle_locks:
+                    self._lifecycle_locks[alias] = asyncio.Lock()
+                self._start_configs[alias] = {
+                    "model_name": model_name,
+                    "model_path": model_path,
+                    "gpu_memory_utilization": gpu_memory_utilization,
+                    "max_model_len": max_model_len,
+                    "tensor_parallel_size": tensor_parallel_size,
+                    "fake": fake,
+                    "fake_response": fake_response,
+                    "fake_delay": fake_delay,
+                    "fake_delay_ms": fake_delay_ms,
+                    "fake_capacity": fake_capacity,
+                }
+                self._schedule_start(alias)
+            elif instance.status == InstanceStatus.STARTING:
+                self._schedule_start(alias)
+            logger.warning("Instance %s already exists", alias)
+            return instance
 
-        if alias in self.fake_instances:
-            logger.warning(f"Fake instance {alias} already exists")
-            return self.instances[alias]
-        
-        # 处理模型路径
-        if model_path:
-            model_path = os.path.expanduser(model_path)
-            if not os.path.isdir(model_path):
-                logger.warning(f"Model path {model_path} not found, using model_name: {model_name}")
-                model_path = model_name
-        else:
-            model_path = model_name
-        
-        # 自动检测 tensor_parallel_size
-        if tensor_parallel_size is None:
-            tensor_parallel_size = torch.cuda.device_count()
-            logger.info(f"Auto-detected tensor_parallel_size: {tensor_parallel_size}")
-        
-        logger.info(f"Starting vLLM engine '{alias}' with model: {model_path}")
-        logger.info(f"  GPU memory utilization: {gpu_memory_utilization}")
-        logger.info(f"  Tensor parallel size: {tensor_parallel_size}")
-        logger.info(f"  Max model length: {max_model_len}")
-        
-        # 创建实例信息（先标记为 STARTING）
         instance = VLLMInstanceInfo(
             alias=alias,
             model_name=model_name,
-            port=0,  # 不需要端口，直接调用
+            port=0,
             status=InstanceStatus.STARTING,
             created_at=time.time(),
-            base_url="",  # 不需要 URL
-            pid=0  # 不需要独立进程
+            base_url="",
+            pid=0,
         )
-        
+
         self.instances[alias] = instance
         self._lifecycle_locks[alias] = asyncio.Lock()
         self._inflight_requests[alias] = 0
@@ -232,51 +256,208 @@ class VLLMManager:
             "e2e_last": None,
             "e2e_avg": None,
         }
-        
+        self._start_configs[alias] = {
+            "model_name": model_name,
+            "model_path": model_path,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "max_model_len": max_model_len,
+            "tensor_parallel_size": tensor_parallel_size,
+            "fake": fake,
+            "fake_response": fake_response,
+            "fake_delay": fake_delay,
+            "fake_delay_ms": fake_delay_ms,
+            "fake_capacity": fake_capacity,
+        }
+        self._schedule_start(alias)
+        return instance
+
+    def _schedule_start(self, alias: str) -> None:
+        task = self._start_tasks.get(alias)
+        if task and not task.done():
+            return
+        self._start_tasks[alias] = asyncio.create_task(self._start_instance_worker(alias))
+
+    def _schedule_reload(self, alias: str) -> None:
+        task = self._reload_tasks.get(alias)
+        if task and not task.done():
+            return
+        self._reload_tasks[alias] = asyncio.create_task(self._reload_instance_worker(alias))
+
+    def _schedule_wake(self, alias: str) -> None:
+        task = self._wake_tasks.get(alias)
+        if task and not task.done():
+            return
+        self._wake_tasks[alias] = asyncio.create_task(self._wake_instance_worker(alias))
+
+    def _purge_instance(self, alias: str) -> None:
+        """Clean runtime state for a failed instance while keeping the record."""
+        self._start_configs.pop(alias, None)
+        self.fake_instances.pop(alias, None)
+        self.sleep_levels.pop(alias, None)
+        self.engine_args.pop(alias, None)
+        self.processors.pop(alias, None)
+        self.engines.pop(alias, None)
+        self._inflight_requests[alias] = 0
+        self._latency_metrics[alias] = {
+            "count": 0,
+            "ttft_last": None,
+            "ttft_avg": None,
+            "e2e_last": None,
+            "e2e_avg": None,
+        }
+
+    async def _reload_instance_worker(self, alias: str) -> None:
+        instance = self.instances.get(alias)
+        if not instance:
+            return
+        if instance.status != InstanceStatus.STARTING:
+            return
         try:
-            def _build_engine_sync():
-                logger.info(f"Loading AutoProcessor for '{alias}'...")
-                processor = AutoProcessor.from_pretrained(
-                    model_path,
-                    trust_remote_code=True,
-                )
-                logger.info(f"✅ AutoProcessor loaded for '{alias}'")
+            await self._reload_engine(alias, replace_existing=True)
+        except Exception as exc:
+            instance = self.instances.get(alias)
+            if instance and instance.status == InstanceStatus.STARTING:
+                instance.status = InstanceStatus.ERROR
+            logger.error("❌ Failed to reload vLLM engine '%s': %s", alias, exc)
+        finally:
+            self._reload_tasks.pop(alias, None)
 
-                engine_args = AsyncEngineArgs(
-                    model=model_path,
-                    mm_encoder_tp_mode="data",  # Qwen3-VL 推荐设置
-                    enable_expert_parallel=False,
-                    tensor_parallel_size=tensor_parallel_size,
-                    gpu_memory_utilization=gpu_memory_utilization,
-                    max_model_len=max_model_len,
-                    seed=0,
-                    trust_remote_code=True,
-                )
+    async def _wake_instance_worker(self, alias: str) -> None:
+        instance = self.instances.get(alias)
+        if not instance or instance.status != InstanceStatus.STARTING:
+            self._wake_tasks.pop(alias, None)
+            return
+        current_level = self.sleep_levels.get(alias, SleepLevel.ACTIVE)
+        if alias not in self._lifecycle_locks:
+            self._lifecycle_locks[alias] = asyncio.Lock()
+        try:
+            async with self._lifecycle_locks[alias]:
+                await self._wake_up(alias, current_level)
+                instance = self.instances.get(alias)
+                if instance:
+                    instance.status = InstanceStatus.RUNNING
+                    self.update_last_used(alias)
+                self.sleep_levels[alias] = SleepLevel.ACTIVE
+        except Exception as exc:
+            instance = self.instances.get(alias)
+            if instance and instance.status == InstanceStatus.STARTING:
+                instance.status = InstanceStatus.ERROR
+            logger.error("❌ Failed to wake vLLM engine '%s': %s", alias, exc)
+        finally:
+            self._wake_tasks.pop(alias, None)
 
-                logger.info(f"Creating AsyncLLMEngine for '{alias}'...")
-                engine = AsyncLLMEngine.from_engine_args(engine_args)
-                return processor, engine, engine_args
+    async def _start_instance_worker(self, alias: str) -> None:
+        config = self._start_configs.get(alias)
+        if not config:
+            return
 
-            start_time = time.time()
-            processor, engine, engine_args = await asyncio.to_thread(_build_engine_sync)
+        instance = self.instances.get(alias)
+        if not instance or instance.status != InstanceStatus.STARTING:
+            return
 
-            self.processors[alias] = processor
-            self.engines[alias] = engine
-            self.engine_args[alias] = engine_args  # 保存引擎参数供重新加载使用
-            self.sleep_levels[alias] = SleepLevel.ACTIVE  # 初始为激活状态
-            instance.status = InstanceStatus.RUNNING
+        try:
+            if config.get("fake"):
+                await self._start_fake_instance_impl(alias, config)
+            else:
+                await self._start_real_instance_impl(alias, config)
+        except Exception as exc:
+            instance = self.instances.get(alias)
+            if instance and instance.status == InstanceStatus.STARTING:
+                instance.status = InstanceStatus.ERROR
+            self._purge_instance(alias)
+            logger.error("❌ Failed to start vLLM engine '%s': %s", alias, exc)
+        finally:
+            self._start_configs.pop(alias, None)
+            self._start_tasks.pop(alias, None)
 
-            elapsed = time.time() - start_time
-            logger.info(f"✅ vLLM engine '{alias}' is READY! (took {elapsed:.1f}s)")
+    async def _start_real_instance_impl(self, alias: str, config: Dict) -> None:
+        model_name = config.get("model_name")
+        model_path = config.get("model_path")
+        gpu_memory_utilization = config.get("gpu_memory_utilization", 0.75)
+        max_model_len = config.get("max_model_len", 4096)
+        tensor_parallel_size = config.get("tensor_parallel_size")
 
-            return instance
+        if model_path:
+            model_path = os.path.expanduser(model_path)
+            if not os.path.isdir(model_path):
+                logger.warning("Model path %s not found, using model_name: %s", model_path, model_name)
+                model_path = model_name
+        else:
+            model_path = model_name
 
-        except Exception as e:
-            logger.error(f"❌ Failed to start vLLM engine '{alias}': {e}")
-            instance.status = InstanceStatus.ERROR
-            # 清理已加载的资源
-            self.processors.pop(alias, None)
-            raise
+        if tensor_parallel_size is None:
+            tensor_parallel_size = torch.cuda.device_count()
+            logger.info("Auto-detected tensor_parallel_size: %s", tensor_parallel_size)
+
+        logger.info("Starting vLLM engine '%s' with model: %s", alias, model_path)
+        logger.info("  GPU memory utilization: %s", gpu_memory_utilization)
+        logger.info("  Tensor parallel size: %s", tensor_parallel_size)
+        logger.info("  Max model length: %s", max_model_len)
+
+        def _build_engine_sync():
+            logger.info("Loading AutoProcessor for '%s'...", alias)
+            processor = AutoProcessor.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+            )
+            logger.info("✅ AutoProcessor loaded for '%s'", alias)
+
+            engine_args = AsyncEngineArgs(
+                model=model_path,
+                mm_encoder_tp_mode="data",
+                enable_expert_parallel=False,
+                tensor_parallel_size=tensor_parallel_size,
+                gpu_memory_utilization=gpu_memory_utilization,
+                max_model_len=max_model_len,
+                seed=0,
+                trust_remote_code=True,
+            )
+
+            logger.info("Creating AsyncLLMEngine for '%s'...", alias)
+            engine = AsyncLLMEngine.from_engine_args(engine_args)
+            return processor, engine, engine_args
+
+        start_time = time.time()
+        processor, engine, engine_args = await asyncio.to_thread(_build_engine_sync)
+
+        instance = self.instances.get(alias)
+        if not instance or instance.status != InstanceStatus.STARTING:
+            del engine
+            return
+
+        self.processors[alias] = processor
+        self.engines[alias] = engine
+        self.engine_args[alias] = engine_args
+        self.sleep_levels[alias] = SleepLevel.ACTIVE
+        instance.status = InstanceStatus.RUNNING
+        self.update_last_used(alias)
+
+        elapsed = time.time() - start_time
+        logger.info("✅ vLLM engine '%s' is READY! (took %.1fs)", alias, elapsed)
+
+    async def _start_fake_instance_impl(self, alias: str, config: Dict) -> None:
+        response = config.get("fake_response") or "OK"
+        delay_s = None
+        if config.get("fake_delay") is not None:
+            delay_s = float(config.get("fake_delay"))
+        elif config.get("fake_delay_ms") is not None:
+            delay_s = float(config.get("fake_delay_ms")) / 1000.0
+        if delay_s is None:
+            delay_s = 0.5
+        capacity = int(config.get("fake_capacity") or 1)
+
+        fake = FakeInstance(response=response, delay_s=delay_s, capacity=capacity)
+        self.fake_instances[alias] = fake
+
+        instance = self.instances.get(alias)
+        if not instance or instance.status != InstanceStatus.STARTING:
+            self.fake_instances.pop(alias, None)
+            return
+
+        self.sleep_levels[alias] = SleepLevel.ACTIVE
+        instance.status = InstanceStatus.RUNNING
+        self.update_last_used(alias)
+        logger.info("✅ Fake instance '%s' ready (delay=%ss, capacity=%s)", alias, delay_s, capacity)
 
     async def start_fake_instance(
         self,
@@ -285,37 +466,15 @@ class VLLMManager:
         delay_s: float = 0.5,
         capacity: int = 1,
     ) -> VLLMInstanceInfo:
-        """启动一个假模型实例，用于调度测试"""
-        if alias in self.instances:
-            logger.warning(f"Instance {alias} already exists")
-            return self.instances[alias]
-
-        fake = FakeInstance(response=response, delay_s=delay_s, capacity=capacity)
-        self.fake_instances[alias] = fake
-
-        instance = VLLMInstanceInfo(
+        """触发一个假模型实例启动，立即返回 STARTING 状态。"""
+        return await self.start_instance(
             alias=alias,
             model_name="__fake__",
-            port=0,
-            status=InstanceStatus.RUNNING,
-            created_at=time.time(),
-            base_url="",
-            pid=0,
+            fake=True,
+            fake_response=response,
+            fake_delay=delay_s,
+            fake_capacity=capacity,
         )
-        self.instances[alias] = instance
-        self.sleep_levels[alias] = SleepLevel.ACTIVE
-        self._lifecycle_locks[alias] = asyncio.Lock()
-        self._inflight_requests[alias] = 0
-        self._latency_metrics[alias] = {
-            "count": 0,
-            "ttft_last": None,
-            "ttft_avg": None,
-            "e2e_last": None,
-            "e2e_avg": None,
-        }
-
-        logger.info(f"✅ Fake instance '{alias}' ready (delay={delay_s}s, capacity={capacity})")
-        return instance
     
     async def set_sleep_level(self, alias: str, level: SleepLevel) -> bool:
         """设置引擎的睡眠级别
@@ -362,10 +521,11 @@ class VLLMManager:
                 instance.status = InstanceStatus.SLEEPING
             async with self._lifecycle_locks[alias]:
                 if level == SleepLevel.ACTIVE:
-                    if instance and current_level == SleepLevel.UNLOADED:
+                    if instance:
                         instance.status = InstanceStatus.STARTING
-                    # 从任何睡眠级别唤醒到激活状态
-                    await self._wake_up(alias, current_level)
+                    # 统一走异步唤醒（含 UNLOADED）
+                    self._schedule_wake(alias)
+                    return True
                 elif level == SleepLevel.SLEEP_1:
                     # 进入 sleep level 1
                     if current_level == SleepLevel.ACTIVE:
@@ -492,6 +652,8 @@ class VLLMManager:
         self.engines[alias] = engine
         if instance:
             instance.status = InstanceStatus.RUNNING
+            self.update_last_used(alias)
+        self.sleep_levels[alias] = SleepLevel.ACTIVE
         
         elapsed = time.time() - start_time
         logger.info(f"✅ {alias} reloaded (took {elapsed:.1f}s)")
@@ -508,6 +670,7 @@ class VLLMManager:
             return
 
         current_level = self.sleep_levels.get(alias, SleepLevel.ACTIVE)
+        logger.info("ensure_active: alias=%s current_level=%s", alias, current_level.name)
         
         if current_level != SleepLevel.ACTIVE:
             logger.info(f"Engine {alias} is at {current_level.name}, waking up...")
@@ -538,6 +701,7 @@ class VLLMManager:
             # Fake model generation
             start_time = time.perf_counter()
             first_token_time: Optional[float] = None
+            self.update_last_used(alias)
             self._inflight_requests[alias] = self._inflight_requests.get(alias, 0) + 1
             fake = self.fake_instances[alias]
             try:
@@ -671,25 +835,23 @@ class VLLMManager:
                     metrics["e2e_avg"] += (e2e - metrics["e2e_avg"]) / count
 
             self._inflight_requests[alias] = max(self._inflight_requests.get(alias, 1) - 1, 0)
-    
-    async def get_processor(self, alias: str):
-        """获取指定引擎的 processor"""
-        if alias not in self.processors:
-            raise ValueError(f"Processor {alias} not found")
-        return self.processors[alias]
-    
-    async def get_tokenizer(self, alias: str):
-        """获取指定引擎的 tokenizer（已弃用，使用 processor 替代）"""
-        # 为了向后兼容保留此方法
-        if alias not in self.processors:
-            raise ValueError(f"Processor {alias} not found")
-        return self.processors[alias].tokenizer
-    
+
     async def stop_instance(self, alias: str) -> bool:
         """停止 vLLM 引擎实例"""
         if alias not in self.instances:
             logger.warning(f"Instance {alias} not found")
             return False
+
+        task = self._start_tasks.pop(alias, None)
+        if task and not task.done():
+            task.cancel()
+        reload_task = self._reload_tasks.pop(alias, None)
+        if reload_task and not reload_task.done():
+            reload_task.cancel()
+        wake_task = self._wake_tasks.pop(alias, None)
+        if wake_task and not wake_task.done():
+            wake_task.cancel()
+        self._start_configs.pop(alias, None)
         
         # 移除引擎
         engine = self.engines.pop(alias, None)

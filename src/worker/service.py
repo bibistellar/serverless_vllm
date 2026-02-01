@@ -21,15 +21,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 import uvicorn
 
-from src.common.models import VLLMInstanceInfo, InstanceStatus, WorkerStatus
+from src.common.models import InstanceStatus
 from src.common.utils import get_gpu_info
-from src.worker.vllm_manager import VLLMManager
+from src.worker.vllm_instance import VLLMManager,SleepLevel
 from src.worker.openai_protocol import (
     ChatCompletionRequest,
-    CompletionRequest,
     convert_to_sampling_params,
     format_chat_completion_response,
-    format_completion_response,
     stream_chat_completion
 )
 
@@ -123,27 +121,19 @@ class WorkerService:
                 if body.get("fake", False):
                     is_fake = True
 
-                if is_fake:
-                    fake_response = body.get("fake_response", "FAKE_RESPONSE")
-                    fake_delay = body.get("fake_delay", None)
-                    fake_delay_ms = body.get("fake_delay_ms", 500)
-                    delay_s = float(fake_delay) if fake_delay is not None else float(fake_delay_ms) / 1000.0
-                    fake_capacity = int(body.get("fake_capacity", 1))
-                    instance = await self.vllm_manager.start_fake_instance(
-                        alias=alias,
-                        response=fake_response,
-                        delay_s=delay_s,
-                        capacity=fake_capacity,
-                    )
-                else:
-                    instance = await self.vllm_manager.start_instance(
-                        alias=alias,
-                        model_name=model_name,
-                        model_path=body.get("model_path"),
-                        gpu_memory_utilization=body.get("gpu_memory_utilization", 0.9),
-                        max_model_len=body.get("max_model_len"),
-                        tensor_parallel_size=body.get("tensor_parallel_size", 1)
-                    )
+                instance = await self.vllm_manager.start_instance(
+                    alias=alias,
+                    model_name=model_name,
+                    model_path=body.get("model_path"),
+                    gpu_memory_utilization=body.get("gpu_memory_utilization", 0.9),
+                    max_model_len=body.get("max_model_len"),
+                    tensor_parallel_size=body.get("tensor_parallel_size", 1),
+                    fake=is_fake,
+                    fake_response=body.get("fake_response"),
+                    fake_delay=body.get("fake_delay"),
+                    fake_delay_ms=body.get("fake_delay_ms"),
+                    fake_capacity=body.get("fake_capacity"),
+                )
                 
                 return {
                     "status": "success",
@@ -174,15 +164,6 @@ class WorkerService:
                 }
             }
         
-        @self.app.get("/instances/{alias}")
-        async def get_instance(alias: str):
-            """获取实例信息"""
-            instance = self.vllm_manager.get_instance(alias)
-            if instance:
-                return instance.to_dict()
-            else:
-                raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
-        
         @self.app.get("/instances/{alias}/status")
         async def get_instance_status(alias: str):
             """获取实例详细状态（包括睡眠级别）"""
@@ -208,7 +189,6 @@ class WorkerService:
                 
                 # 支持数字或名称
                 if "level_name" in body:
-                    from src.worker.vllm_manager import SleepLevel
                     level_name = body["level_name"].upper()
                     try:
                         level = SleepLevel[level_name]
@@ -218,7 +198,6 @@ class WorkerService:
                             detail=f"Invalid level_name: {level_name}. Must be one of: ACTIVE, SLEEP_1, SLEEP_2, UNLOADED"
                         )
                 elif "level" in body:
-                    from src.worker.vllm_manager import SleepLevel
                     level_value = body["level"]
                     try:
                         level = SleepLevel(level_value)
@@ -257,8 +236,6 @@ class WorkerService:
         @self.app.post("/instances/{alias}/wake")
         async def wake_instance(alias: str):
             """唤醒实例到激活状态"""
-            from src.worker.vllm_manager import SleepLevel
-            
             try:
                 success = await self.vllm_manager.set_sleep_level(alias, SleepLevel.ACTIVE)
                 
@@ -276,68 +253,21 @@ class WorkerService:
                 logger.error(f"Error waking up {alias}: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
         
-        @self.app.post("/sleep/config")
-        async def configure_auto_sleep(request: Request):
-            """配置自动睡眠参数
-            
-            请求体：
-            {
-                "enable": true,
-                "sleep_1_timeout": 300,
-                "sleep_2_timeout": 900,
-                "unload_timeout": 1800
-            }
-            """
-            try:
-                body = await request.json()
-                
-                if "enable" in body:
-                    self.vllm_manager.enable_auto_sleep = body["enable"]
-                
-                if "sleep_1_timeout" in body:
-                    self.vllm_manager.sleep_1_timeout = body["sleep_1_timeout"]
-                
-                if "sleep_2_timeout" in body:
-                    self.vllm_manager.sleep_2_timeout = body["sleep_2_timeout"]
-                
-                if "unload_timeout" in body:
-                    self.vllm_manager.unload_timeout = body["unload_timeout"]
-                
-                return {
-                    "status": "success",
-                    "config": {
-                        "enable_auto_sleep": self.vllm_manager.enable_auto_sleep,
-                        "sleep_1_timeout": self.vllm_manager.sleep_1_timeout,
-                        "sleep_2_timeout": self.vllm_manager.sleep_2_timeout,
-                        "unload_timeout": self.vllm_manager.unload_timeout
-                    }
-                }
-                
-            except Exception as e:
-                logger.error(f"Error configuring auto-sleep: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
-        
-        @self.app.get("/sleep/config")
-        async def get_sleep_config():
-            instance = self.vllm_manager.get_instance(alias)
-            if not instance:
-                raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
-            else:
-                """获取当前的自动睡眠配置"""
-                return {
-                    "enable_auto_sleep": self.vllm_manager.enable_auto_sleep,
-                    "sleep_1_timeout": self.vllm_manager.sleep_1_timeout,
-                    "sleep_2_timeout": self.vllm_manager.sleep_2_timeout,
-                    "unload_timeout": self.vllm_manager.unload_timeout,
-                }
-
-        
         @self.app.post("/proxy/{alias}/v1/chat/completions")
         async def chat_completions(alias: str, request: ChatCompletionRequest):
             """OpenAI Chat Completions API - Qwen3-VL 优化版本"""
             instance = self.vllm_manager.get_instance(alias)
             if not instance:
                 raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
+
+            sleep_level = self.vllm_manager.get_sleep_level(alias)
+            logger.info(
+                "proxy chat: alias=%s status=%s sleep_level=%s inflight=%s",
+                alias,
+                instance.status.value,
+                sleep_level.name if sleep_level else "unknown",
+                self.vllm_manager._inflight_requests.get(alias, 0),
+            )
 
             # 自动唤醒（包括 UNLOADED）
             await self.vllm_manager.ensure_active(alias)
@@ -421,74 +351,6 @@ class WorkerService:
                 logger.error(f"Error during generation for {alias}: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
         
-        @self.app.post("/proxy/{alias}/v1/completions")
-        async def completions(alias: str, request: CompletionRequest):
-            """OpenAI Completions API - 简化版本（不推荐使用，请使用 Chat Completions）"""
-            instance = self.vllm_manager.get_instance(alias)
-            if not instance:
-                raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
-
-            # 自动唤醒（包括 UNLOADED）
-            await self.vllm_manager.ensure_active(alias)
-            
-            # 检查模型状态
-            if instance.status == InstanceStatus.STARTING:
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": {
-                            "message": f"模型 {alias} 正在加载中，请稍候再试...",
-                            "type": "model_loading",
-                            "code": "model_not_ready",
-                            "status": "starting"
-                        }
-                    }
-                )
-            elif instance.status != InstanceStatus.RUNNING:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Instance {alias} is not running"
-                )
-            
-            # 将 prompt 转换为消息格式
-            messages = [{"role": "user", "content": request.prompt}]
-            
-            # 构建采样参数
-            sampling_params = convert_to_sampling_params(
-                temperature=request.temperature,
-                top_p=request.top_p,
-                max_tokens=request.max_tokens,
-                stop=request.stop
-            )
-            
-            # 生成请求 ID
-            import uuid
-            request_id = str(uuid.uuid4())
-            
-            try:
-                # 使用统一的 generate 方法
-                full_text = ""
-                finish_reason = "stop"
-                
-                async for output in self.vllm_manager.generate(alias, messages, sampling_params):
-                    for completion_output in output.outputs:
-                        full_text = completion_output.text
-                        if completion_output.finish_reason:
-                            finish_reason = completion_output.finish_reason
-                
-                response = format_completion_response(
-                    request_id=request_id,
-                    model=request.model,
-                    text=full_text,
-                    finish_reason=finish_reason
-                )
-                
-                return JSONResponse(content=response)
-            
-            except Exception as e:
-                logger.error(f"Error during generation for {alias}: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
-    
     async def register_to_manager(self):
         """向中央 Manager 注册"""
         if not self.manager_url:

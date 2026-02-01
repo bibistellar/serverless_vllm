@@ -44,12 +44,15 @@ class WorkerRegistryCore:
         min_replicas: int = 1,
         max_replicas: int = 8,
         scale_interval: float = 10.0,
+        status_refresh_interval: Optional[float] = None,
+        fast_wake_timeout: float = 3.0,
+        fast_wake_interval: float = 0.5,
     ) -> None:
         self.workers: Dict[str, Dict] = {}
         self.model_instances: Dict[str, list] = {}
         self.model_configs: Dict[str, Dict] = {}
         self.failure_counts: Dict[str, int] = {}
-        self._replica_counters: Dict[str, int] = {}
+        self._worker_replica_counters: Dict[str, int] = {}
         self._rr_index = 0
         self._lock = asyncio.Lock()
         self.healthcheck_interval = healthcheck_interval
@@ -66,6 +69,14 @@ class WorkerRegistryCore:
             health_timeout=healthcheck_timeout,
         )
         # self.autoscaler.start(self)
+        if status_refresh_interval is None:
+            status_refresh_interval = scale_interval
+        self.status_refresh_interval = float(
+            os.getenv("SERVE_STATUS_REFRESH_INTERVAL", str(status_refresh_interval))
+        )
+        self.fast_wake_timeout = float(os.getenv("SERVE_FAST_WAKE_TIMEOUT", str(fast_wake_timeout)))
+        self.fast_wake_interval = float(os.getenv("SERVE_FAST_WAKE_INTERVAL", str(fast_wake_interval)))
+        self._status_task = asyncio.create_task(self._status_refresh_loop())
 
     async def register_worker(
         self,
@@ -118,6 +129,116 @@ class WorkerRegistryCore:
     async def select_instance_for_request(self, alias: str) -> Optional[Dict]:
         await self._prune_orphan_instances()
         return await self.autoscaler.select_instance(self, alias)
+
+    def _sleep_level_value(self, instance: Dict) -> int:
+        value = instance.get("sleep_level_value")
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+        level_name = instance.get("sleep_level")
+        if isinstance(level_name, str):
+            mapping = {
+                "ACTIVE": 0,
+                "SLEEP_1": 1,
+                "SLEEP_2": 2,
+                "UNLOADED": 3,
+            }
+            return mapping.get(level_name.upper(), 3)
+        return 3
+
+    def _is_instance_ready(self, instance: Dict) -> bool:
+        status = instance.get("status")
+        if status != "running":
+            return False
+        return self._sleep_level_value(instance) == 0
+
+    def _sleep_rank(self, instance: Dict) -> int:
+        status = instance.get("status")
+        if status == "starting":
+            return 4
+        if status == "running":
+            return self._sleep_level_value(instance)
+        return 5
+
+    async def _status_refresh_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.status_refresh_interval)
+            try:
+                await self.autoscaler._refresh_metrics(self)
+            except Exception as exc:
+                logger.warning("Status refresh loop error: %s", exc)
+
+    async def _probe_instance(self, instance: Dict) -> Optional[Dict]:
+        worker_url = instance.get("control_url") or instance.get("worker_url")
+        inst_alias = instance.get("instance_alias")
+        if not worker_url or not inst_alias:
+            return None
+        async with httpx.AsyncClient(timeout=self.healthcheck_timeout) as client:
+            resp = await client.get(f"{worker_url}/instances/{inst_alias}/status")
+            if resp.status_code != 200:
+                return None
+            status = resp.json()
+        inflight = int(status.get("inflight_requests", 0))
+        sleep_level = int(status.get("sleep_level_value", 0))
+        capacity = status.get("capacity") or self.autoscaler.instance_capacity
+        capacity = max(1, int(capacity))
+        load = min(inflight / capacity, 1.0)
+        async with self._lock:
+            instance["inflight_requests"] = inflight
+            instance["sleep_level_value"] = sleep_level
+            instance["load"] = load
+            instance["capacity"] = capacity
+            if "status" in status:
+                instance["status"] = status["status"]
+        return instance
+
+    async def _wait_for_ready(self, instance: Dict) -> Optional[Dict]:
+        if self.fast_wake_timeout <= 0:
+            return None
+        deadline = time.monotonic() + self.fast_wake_timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(self.fast_wake_interval)
+            await self._probe_instance(instance)
+            if self._is_instance_ready(instance):
+                return instance
+        return None
+
+    async def _handle_sleeping(self, alias: str, preferred: Optional[Dict] = None) -> Optional[Dict]:
+        instances = self.model_instances.get(alias, [])
+        if not instances:
+            return None
+        candidate = preferred or min(instances, key=self._sleep_rank)
+        await self._probe_instance(candidate)
+        if self._is_instance_ready(candidate):
+            return candidate
+        level = self._sleep_level_value(candidate)
+        if level in (1, 2):
+            await self._wake_instance(candidate)
+            return await self._wait_for_ready(candidate)
+        await self._wake_instance(candidate)
+        return None
+
+    async def resolve_instance_for_request(self, alias: str) -> tuple[Optional[Dict], str]:
+        await self._prune_orphan_instances()
+        instances = list(self.model_instances.get(alias, []))
+        if not instances:
+            return None, "not_found"
+        ready_cached = [i for i in instances if self._is_instance_ready(i)]
+        if ready_cached:
+            candidate = min(ready_cached, key=lambda i: i.get("load", 0.0))
+            await self._probe_instance(candidate)
+            if self._is_instance_ready(candidate):
+                return candidate, "ready"
+            candidate = await self._handle_sleeping(alias, candidate)
+            if candidate:
+                return candidate, "ready"
+            return None, "not_ready"
+        candidate = await self._handle_sleeping(alias, None)
+        if candidate:
+            return candidate, "ready"
+        return None, "not_ready"
 
     def _iter_worker_devices(self, worker: Dict) -> List[Dict]:
         gpu_info = worker.get("gpu_info") or {}
@@ -192,12 +313,13 @@ class WorkerRegistryCore:
         utilization = gpu_memory_gb / total_memory
         return max(0.0, min(1.0, utilization))
 
-    def _next_instance_alias(self, model_alias: str) -> str:
-        count = self._replica_counters.get(model_alias, 0) + 1
-        self._replica_counters[model_alias] = count
+    def _next_instance_alias(self, worker_id: str, model_alias: str) -> str:
+        key = f"{worker_id}:{model_alias}"
+        count = self._worker_replica_counters.get(key, 0) + 1
+        self._worker_replica_counters[key] = count
         if count == 1:
-            return model_alias
-        return f"{model_alias}-r{count}"
+            return f"{worker_id}-{model_alias}"
+        return f"{worker_id}-{model_alias}-r{count}"
 
     async def _start_instance_on_worker(self, worker_url: str, instance_alias: str, payload: Dict) -> Dict:
         new_payload = dict(payload)
@@ -235,7 +357,7 @@ class WorkerRegistryCore:
         if not worker:
             return
         control_url = worker["worker_url"]
-        instance_alias = self._next_instance_alias(model_alias)
+        instance_alias = self._next_instance_alias(worker["worker_id"], model_alias)
         if gpu_memory_gb is None:
             gpu_memory_gb = 0.0
         instance_info = await self._start_instance_on_worker(
@@ -353,7 +475,7 @@ class WorkerRegistryCore:
         }
 
         try:
-            instance_alias = self._next_instance_alias(alias)
+            instance_alias = self._next_instance_alias(worker["worker_id"], alias)
             instance_info = await self._start_instance_on_worker(
                 worker_url=control_url,
                 instance_alias=instance_alias,
@@ -409,7 +531,7 @@ class WorkerRegistryCore:
         async with self._lock:
             self.model_instances.pop(alias, None)
             self.model_configs.pop(alias, None)
-            self._replica_counters.pop(alias, None)
+            # per-worker replica counters are kept; no per-model cleanup needed
 
         return {"status": "success", "message": f"Model {alias} unregistered"}
 
@@ -438,7 +560,7 @@ class WorkerRegistryCore:
             for alias in aliases_to_remove:
                 self.model_instances.pop(alias, None)
                 self.model_configs.pop(alias, None)
-                self._replica_counters.pop(alias, None)
+            # per-worker replica counters are kept; no per-model cleanup needed
 
     def _unregister_worker_locked(self, worker_id: str) -> Dict:
         if worker_id not in self.workers:
@@ -458,7 +580,7 @@ class WorkerRegistryCore:
             else:
                 self.model_instances.pop(alias, None)
                 self.model_configs.pop(alias, None)
-                self._replica_counters.pop(alias, None)
+            # per-worker replica counters are kept; no per-model cleanup needed
 
         self.workers.pop(worker_id, None)
         self.failure_counts.pop(worker_id, None)
@@ -524,6 +646,21 @@ def _filter_response_headers(headers: httpx.Headers) -> Dict:
     return filtered
 
 
+def _model_not_ready_response(model: str, status: str = "starting", retry_after: int = 5) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "message": f"Model {model} is starting or sleeping, please retry later.",
+                "type": "model_loading",
+                "code": "model_not_ready",
+                "status": status,
+                "retry_after": retry_after,
+            }
+        },
+        headers={"Retry-After": str(retry_after)},
+    )
+
 fastapi_app = FastAPI(title="LLM Router+Manager (Ray Serve)")
 _MAX_ONGOING = int(os.getenv("SERVE_MAX_ONGOING_REQUESTS", "100"))
 
@@ -567,9 +704,11 @@ class RouterManagerServe(WorkerRegistryCore):
         if not model:
             raise HTTPException(status_code=400, detail="model is required")
 
-        routing = await self.select_instance_for_request(model)
-        if not routing:
+        routing, status = await self.resolve_instance_for_request(model)
+        if status == "not_found":
             raise HTTPException(status_code=404, detail=f"Model {model} not found")
+        if status != "ready":
+            return _model_not_ready_response(model)
 
         target_url = f"{routing['worker_url']}/proxy/{routing['instance_alias']}/v1/chat/completions"
         headers = _filter_request_headers(dict(request.headers))
@@ -630,36 +769,6 @@ class RouterManagerServe(WorkerRegistryCore):
             logger.error("Error forwarding request: %s", exc)
             raise HTTPException(status_code=502, detail=f"Error forwarding request: {exc}")
 
-    @fastapi_app.post("/v1/completions")
-    async def completions(self, request: Request):
-        body = await request.json()
-        model = body.get("model")
-        if not model:
-            raise HTTPException(status_code=400, detail="model is required")
-
-        routing = await self.select_instance_for_request(model)
-        if not routing:
-            raise HTTPException(status_code=404, detail=f"Model {model} not found")
-
-        target_url = f"{routing['worker_url']}/proxy/{routing['instance_alias']}/v1/completions"
-        headers = _filter_request_headers(dict(request.headers))
-
-        async with httpx.AsyncClient(timeout=self.request_timeout) as client:
-            try:
-                response = await client.post(target_url, json=body, headers=headers)
-                if response.headers.get("content-type", "").startswith("application/json"):
-                    return JSONResponse(content=response.json(), status_code=response.status_code)
-                return Response(
-                    content=response.content,
-                    status_code=response.status_code,
-                    headers=_filter_response_headers(response.headers),
-                )
-            except httpx.TimeoutException:
-                raise HTTPException(status_code=504, detail="Request timed out")
-            except Exception as exc:
-                logger.error("Error forwarding request: %s", exc)
-                raise HTTPException(status_code=502, detail=f"Error forwarding request: {exc}")
-
     @fastapi_app.get("/v1/models")
     async def openai_list_models(self):
         result = await self.list_models()
@@ -708,6 +817,23 @@ class RouterManagerServe(WorkerRegistryCore):
     @fastapi_app.get("/admin/models")
     async def admin_list_models(self):
         return await self.list_models()
+
+    @fastapi_app.post("/admin/models/{alias}/wake")
+    async def admin_wake_model(self, alias: str):
+        instances = self.model_instances.get(alias, [])
+        if not instances:
+            raise HTTPException(status_code=404, detail=f"Model {alias} not found")
+        sleeping = [i for i in instances if i.get("sleep_level_value", 0) > 0]
+        if not sleeping:
+            return {"status": "success", "message": "no sleeping instances", "woken": False}
+        candidate = min(sleeping, key=lambda i: i.get("sleep_level_value", 3))
+        await self._wake_instance(candidate)
+        return {
+            "status": "success",
+            "message": f"woke instance {candidate.get('instance_alias')}",
+            "instance_alias": candidate.get("instance_alias"),
+            "woken": True,
+        }
 
     @fastapi_app.get("/admin/workers")
     async def admin_list_workers(self):

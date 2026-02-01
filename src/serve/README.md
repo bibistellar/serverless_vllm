@@ -90,6 +90,84 @@ print(resp.choices[0].message.content)
 - 平均负载 < 0.3：按 ACTIVE → SLEEP_1 → SLEEP_2 → UNLOADED 逐步休眠。
 - 负载 = `inflight_requests / capacity`（capacity 可配置或从假模型返回）。
 
+## Serve 对模型可用性的判断（当前逻辑）
+
+本节描述当前讨论后的 Serve 行为，用于后续实现细化。
+
+### 1) 状态获取与缓存
+- Serve **定时探测** Worker `/instances/{alias}/status` 并缓存实例状态。
+- 新请求到来后，先根据缓存选择候选实例，再对候选实例做 **一次即时探测** 以确认可用性。
+
+### 2) 可用性判定
+- **可用**：`status == RUNNING` 且 `sleep_level_value == 0`（ACTIVE）。
+- **不可用**：`status == STARTING`，或 `sleep_level_value > 0`（SLEEP_1/2/UNLOADED），或实例不可达。
+
+### 3) /v1/chat 的处理流程
+- **缓存存在可用实例**：选中候选实例后即时探测。
+  - 探测可用：正常转发。
+  - 探测不可用：转入“休眠处理逻辑”（不一定立即返回失败）。
+- **缓存显示全部休眠**：直接转入“休眠处理逻辑”。
+
+### 4) 休眠处理逻辑（分级）
+- **SLEEP_1 / SLEEP_2**：认为可快速唤醒，由 Serve 负责完成唤醒。
+  - Serve 触发唤醒，并进行 **短窗口轮询**（例如 1~3 秒）等待 RUNNING/ACTIVE。
+  - 短窗口内恢复：正常转发（表现为本次调用就绪时间偏长）。
+  - 未恢复：返回“服务准备中，请稍后重试”（HTTP 503）。
+- **UNLOADED / STARTING**：认为冷启动耗时较长。
+  - Serve 触发唤醒/加载（如有必要），**直接返回**“服务准备中，请稍后重试”（HTTP 503）。
+
+### 5) 错误返回建议
+当服务尚不可用时，返回结构示例：
+```json
+{
+  "error": {
+    "message": "Model qwen3-vl-2b is starting or sleeping, please retry later.",
+    "type": "model_loading",
+    "code": "model_not_ready",
+    "status": "starting",
+    "retry_after": 5
+  }
+}
+```
+
+## 过载表现与弹性调度指标（当前结论）
+
+**过载表现（日常使用）**
+- 不一定出现 `model_not_ready` 或错误码。
+- 主要表现为 **请求排队、延迟上升**（p50/p95/p99 增大）。
+
+**弹性调度应关注的核心指标**
+- **排队/等待**：TTFT、E2E 延迟分位数（p50/p95/p99）。
+- **在途请求**：`inflight_requests`。
+- **实例容量占用**：`inflight_requests / capacity`（负载）。
+
+**调度判断建议**
+- 当延迟分位数持续上升且负载高于阈值时触发扩容。
+- 当负载长期低于阈值且延迟稳定时触发缩容/休眠。
+
+## 自动调度原则（当前讨论结论）
+
+**总体原则**
+- 请求路径只在 **ACTIVE 列表** 中选择实例转发（ACTIVE = RUNNING + sleep_level=ACTIVE）。
+- ACTIVE 列表由 autoscaler 维护，Serve 请求路径不负责唤醒或启动新实例。
+
+**路由策略（当前约定）**
+- 先采用 **平均分发**（后续如需优化再讨论）。
+
+**扩容逻辑（以时延为主）**
+- autoscaler 定期采样实例 E2E 平均延迟（或滑动平均）。
+- 当平均延迟 **高于阈值**（暂定 `SCALE_UP_LATENCY_THRESHOLD = 5s`）时触发扩容。
+- 每次扩容 **只增加一个实例**，并在扩容后进入冷却时间。
+- 扩容顺序：先唤醒 SLEEP_1 → SLEEP_2 → UNLOADED，若仍不足再启动新实例并加入 ACTIVE 列表。
+
+**缩容逻辑（以时延为主）**
+- 不看单实例负载，先看整体平均延迟。
+- 当平均延迟 **低于阈值**（暂定 `SCALE_DOWN_LATENCY_THRESHOLD = 2s`）时触发缩容。
+- 每次缩容 **只移除一个实例**，并在缩容后进入冷却时间。
+- autoscaler 从 ACTIVE 列表移除实例（不强制 sleep，由 Worker 自然降级）。
+
+**说明**
+- 目前缩容/扩容阈值为固定值，后续可再引入自适应或结合负载指标。
 ## 假模型（调度压测）
 
 注册 fake 模型：
