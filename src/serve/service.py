@@ -38,45 +38,40 @@ class WorkerRegistryCore:
         healthcheck_interval: float = 15.0,
         healthcheck_timeout: float = 3.0,
         max_failures: int = 3,
-        load_high: float = 0.7,
-        load_low: float = 0.3,
         instance_capacity: int = 4,
         min_replicas: int = 1,
         max_replicas: int = 8,
         scale_interval: float = 10.0,
-        status_refresh_interval: Optional[float] = None,
-        fast_wake_timeout: float = 3.0,
-        fast_wake_interval: float = 0.5,
     ) -> None:
         self.workers: Dict[str, Dict] = {}
         self.model_instances: Dict[str, list] = {}
         self.model_configs: Dict[str, Dict] = {}
         self.failure_counts: Dict[str, int] = {}
         self._worker_replica_counters: Dict[str, int] = {}
-        self._rr_index = 0
+        self._rr_counters: Dict[str, int] = {}
         self._lock = asyncio.Lock()
         self.healthcheck_interval = healthcheck_interval
         self.healthcheck_timeout = healthcheck_timeout
         self.max_failures = max_failures
         self._health_task = asyncio.create_task(self._health_loop())
+        scale_up_latency_threshold = float(os.getenv("SCALE_UP_LATENCY_THRESHOLD", "5"))
+        scale_down_latency_threshold = float(os.getenv("SCALE_DOWN_LATENCY_THRESHOLD", "2"))
+        scale_up_cooldown_s = float(os.getenv("SCALE_UP_COOLDOWN", "30"))
+        scale_down_cooldown_s = float(os.getenv("SCALE_DOWN_COOLDOWN", "30"))
+        latency_sample_window_s = float(os.getenv("SCALE_LATENCY_WINDOW_S", "30"))
         self.autoscaler = LoadBasedAutoscaler(
-            load_high=load_high,
-            load_low=load_low,
             instance_capacity=instance_capacity,
             min_replicas=min_replicas,
             max_replicas=max_replicas,
             check_interval=scale_interval,
             health_timeout=healthcheck_timeout,
+            scale_up_latency_threshold=scale_up_latency_threshold,
+            scale_down_latency_threshold=scale_down_latency_threshold,
+            scale_up_cooldown_s=scale_up_cooldown_s,
+            scale_down_cooldown_s=scale_down_cooldown_s,
+            latency_sample_window_s=latency_sample_window_s,
         )
-        # self.autoscaler.start(self)
-        if status_refresh_interval is None:
-            status_refresh_interval = scale_interval
-        self.status_refresh_interval = float(
-            os.getenv("SERVE_STATUS_REFRESH_INTERVAL", str(status_refresh_interval))
-        )
-        self.fast_wake_timeout = float(os.getenv("SERVE_FAST_WAKE_TIMEOUT", str(fast_wake_timeout)))
-        self.fast_wake_interval = float(os.getenv("SERVE_FAST_WAKE_INTERVAL", str(fast_wake_interval)))
-        self._status_task = asyncio.create_task(self._status_refresh_loop())
+        self.autoscaler.start(self)
 
     async def register_worker(
         self,
@@ -126,9 +121,12 @@ class WorkerRegistryCore:
             return None
         return instances[0]
 
-    async def select_instance_for_request(self, alias: str) -> Optional[Dict]:
-        await self._prune_orphan_instances()
-        return await self.autoscaler.select_instance(self, alias)
+    def _pick_active_instance(self, alias: str, active: List[Dict]) -> Dict:
+        idx = self._rr_counters.get(alias, 0)
+        if idx >= len(active):
+            idx = 0
+        self._rr_counters[alias] = (idx + 1) % len(active)
+        return active[idx]
 
     def _sleep_level_value(self, instance: Dict) -> int:
         value = instance.get("sleep_level_value")
@@ -154,22 +152,6 @@ class WorkerRegistryCore:
             return False
         return self._sleep_level_value(instance) == 0
 
-    def _sleep_rank(self, instance: Dict) -> int:
-        status = instance.get("status")
-        if status == "starting":
-            return 4
-        if status == "running":
-            return self._sleep_level_value(instance)
-        return 5
-
-    async def _status_refresh_loop(self) -> None:
-        while True:
-            await asyncio.sleep(self.status_refresh_interval)
-            try:
-                await self.autoscaler._refresh_metrics(self)
-            except Exception as exc:
-                logger.warning("Status refresh loop error: %s", exc)
-
     async def _probe_instance(self, instance: Dict) -> Optional[Dict]:
         worker_url = instance.get("control_url") or instance.get("worker_url")
         inst_alias = instance.get("instance_alias")
@@ -182,6 +164,8 @@ class WorkerRegistryCore:
             status = resp.json()
         inflight = int(status.get("inflight_requests", 0))
         sleep_level = int(status.get("sleep_level_value", 0))
+        e2e_avg = status.get("e2e_avg")
+        e2e_last = status.get("e2e_last")
         capacity = status.get("capacity") or self.autoscaler.instance_capacity
         capacity = max(1, int(capacity))
         load = min(inflight / capacity, 1.0)
@@ -190,53 +174,24 @@ class WorkerRegistryCore:
             instance["sleep_level_value"] = sleep_level
             instance["load"] = load
             instance["capacity"] = capacity
+            instance["e2e_avg"] = e2e_avg
+            instance["e2e_last"] = e2e_last
             if "status" in status:
                 instance["status"] = status["status"]
         return instance
 
-    async def _wait_for_ready(self, instance: Dict) -> Optional[Dict]:
-        if self.fast_wake_timeout <= 0:
-            return None
-        deadline = time.monotonic() + self.fast_wake_timeout
-        while time.monotonic() < deadline:
-            await asyncio.sleep(self.fast_wake_interval)
-            await self._probe_instance(instance)
-            if self._is_instance_ready(instance):
-                return instance
-        return None
-
-    async def _handle_sleeping(self, alias: str, preferred: Optional[Dict] = None) -> Optional[Dict]:
-        instances = self.model_instances.get(alias, [])
-        if not instances:
-            return None
-        candidate = preferred or min(instances, key=self._sleep_rank)
-        await self._probe_instance(candidate)
-        if self._is_instance_ready(candidate):
-            return candidate
-        level = self._sleep_level_value(candidate)
-        if level in (1, 2):
-            await self._wake_instance(candidate)
-            return await self._wait_for_ready(candidate)
-        await self._wake_instance(candidate)
-        return None
-
     async def resolve_instance_for_request(self, alias: str) -> tuple[Optional[Dict], str]:
         await self._prune_orphan_instances()
-        instances = list(self.model_instances.get(alias, []))
-        if not instances:
-            return None, "not_found"
-        ready_cached = [i for i in instances if self._is_instance_ready(i)]
-        if ready_cached:
-            candidate = min(ready_cached, key=lambda i: i.get("load", 0.0))
-            await self._probe_instance(candidate)
-            if self._is_instance_ready(candidate):
-                return candidate, "ready"
-            candidate = await self._handle_sleeping(alias, candidate)
-            if candidate:
-                return candidate, "ready"
-            return None, "not_ready"
-        candidate = await self._handle_sleeping(alias, None)
-        if candidate:
+        async with self._lock:
+            instances = list(self.model_instances.get(alias, []))
+            if not instances:
+                return None, "not_found"
+            active = [i for i in instances if i.get("active")]
+            if not active:
+                return None, "not_ready"
+            candidate = self._pick_active_instance(alias, active)
+        await self._probe_instance(candidate)
+        if self._is_instance_ready(candidate):
             return candidate, "ready"
         return None, "not_ready"
 
@@ -394,6 +349,8 @@ class WorkerRegistryCore:
             "inflight_requests": 0,
             "load": 0.0,
             "capacity": config.get("fake_capacity"),
+            "active": False,
+            "pending_active": True,
         }
         async with self._lock:
             self.model_instances.setdefault(model_alias, []).append(instance)
@@ -497,6 +454,8 @@ class WorkerRegistryCore:
                 "inflight_requests": 0,
                 "load": 0.0,
                 "capacity": fake_capacity if fake_capacity is not None else None,
+                "active": False,
+                "pending_active": True,
             }
 
             async with self._lock:
@@ -673,8 +632,6 @@ class RouterManagerServe(WorkerRegistryCore):
         healthcheck_interval: float = 15.0,
         healthcheck_timeout: float = 3.0,
         max_failures: int = 3,
-        load_high: float = 0.7,
-        load_low: float = 0.3,
         instance_capacity: int = 4,
         min_replicas: int = 1,
         max_replicas: int = 8,
@@ -684,8 +641,6 @@ class RouterManagerServe(WorkerRegistryCore):
             healthcheck_interval=healthcheck_interval,
             healthcheck_timeout=healthcheck_timeout,
             max_failures=max_failures,
-            load_high=load_high,
-            load_low=load_low,
             instance_capacity=instance_capacity,
             min_replicas=min_replicas,
             max_replicas=max_replicas,
@@ -899,8 +854,6 @@ def main():
     healthcheck_interval = float(os.getenv("WORKER_HEALTHCHECK_INTERVAL", "15"))
     healthcheck_timeout = float(os.getenv("WORKER_HEALTHCHECK_TIMEOUT", "3"))
     max_failures = int(os.getenv("WORKER_HEALTHCHECK_MAX_FAILURES", "3"))
-    load_high = float(os.getenv("MODEL_LOAD_HIGH", "0.7"))
-    load_low = float(os.getenv("MODEL_LOAD_LOW", "0.3"))
     instance_capacity = int(os.getenv("MODEL_INSTANCE_CAPACITY", "4"))
     min_replicas = int(os.getenv("MODEL_MIN_REPLICAS", "1"))
     max_replicas = int(os.getenv("MODEL_MAX_REPLICAS", "8"))
@@ -911,8 +864,6 @@ def main():
             healthcheck_interval=healthcheck_interval,
             healthcheck_timeout=healthcheck_timeout,
             max_failures=max_failures,
-            load_high=load_high,
-            load_low=load_low,
             instance_capacity=instance_capacity,
             min_replicas=min_replicas,
             max_replicas=max_replicas,

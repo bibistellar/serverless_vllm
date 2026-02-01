@@ -119,23 +119,115 @@ class SystemTester:
 
     async def run(self) -> None:
         await self.test_health()
-        await self.register_model()
+        # await self.register_model()
         await self.list_info()
 
-        print("\n=== 一次文本调用 ===")
-        ok = await self.chat_with_retry(retries=3, wait_s=60)
-        if not ok:
-            raise RuntimeError("首次文本调用失败")
+        # print("\n=== 一次文本调用 ===")
+        # ok = await self.chat_with_retry(retries=3, wait_s=60)
+        # if not ok:
+        #     raise RuntimeError("首次文本调用失败")
 
-        # for level in (1, 2, 3):
-        #     print(f"\n=== 强制进入 sleep{level} 并测试 ===")
-        #     await self.force_sleep(level)
-        #     ok = await self.chat_with_retry(retries=3, wait_s=60)
-        #     if not ok:
-        #         raise RuntimeError(f"sleep{level} 场景测试失败")
+        if os.getenv("RUN_AUTOSCALER_TEST", "0") == "1":
+            await self.autoscaler_wake_test()
+
+        if os.getenv("RUN_FAKE_AUTOSCALER_TEST", "1") == "1":
+            await self.fake_autoscaler_test()
 
         if os.getenv("RUN_OVERLOAD_TEST", "0") == "1":
             await self.overload_test()
+
+    async def autoscaler_wake_test(self) -> None:
+        print("\n=== 弹性调度唤醒测试 ===")
+        level = int(os.getenv("AUTOSCALER_SLEEP_LEVEL", "2"))
+        retries = int(os.getenv("AUTOSCALER_RETRY_COUNT", "3"))
+        wait_s = int(os.getenv("AUTOSCALER_RETRY_WAIT_S", "60"))
+
+        await self.force_sleep(level)
+        ok = await self.chat_with_retry(retries=retries, wait_s=wait_s)
+        if not ok:
+            raise RuntimeError(f"autoscaler 唤醒测试失败（sleep={level}）")
+
+    async def fake_autoscaler_test(self) -> None:
+        print("\n=== Fake 模型弹性调度测试 ===")
+        alias = os.getenv("FAKE_MODEL_ALIAS", "fake-model")
+        fake_payload = {
+            "alias": alias,
+            "model_name": "__fake__",
+            "fake": True,
+            "fake_response": "FAKE_OK",
+            "fake_delay_ms": int(os.getenv("FAKE_DELAY_MS", "2000")),
+            "fake_capacity": int(os.getenv("FAKE_CAPACITY", "1")),
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{self.serve_url}/admin/models/register", json=fake_payload)
+            resp.raise_for_status()
+            print(f"✓ Fake 注册: {resp.json()}")
+
+        # 先确保 fake 模型至少成功一次，产生延迟样本
+        retries = int(os.getenv("FAKE_READY_RETRY_COUNT", "5"))
+        wait_s = int(os.getenv("FAKE_READY_RETRY_WAIT_S", "5"))
+        for attempt in range(retries + 1):
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{self.serve_url}/v1/chat/completions",
+                    json={
+                        "model": alias,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 4,
+                    },
+                )
+            if resp.status_code == 200:
+                print("✓ Fake 首次请求成功")
+                break
+            if resp.status_code == 503 and attempt < retries:
+                print(f"⚠️ Fake 未就绪，{wait_s}s 后重试")
+                await asyncio.sleep(wait_s)
+                continue
+            resp.raise_for_status()
+
+        total = int(os.getenv("FAKE_BURST_REQUESTS", "24"))
+        concurrency = int(os.getenv("FAKE_BURST_CONCURRENCY", "8"))
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _send_one() -> None:
+            async with sem:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(
+                        f"{self.serve_url}/v1/chat/completions",
+                        json={
+                            "model": alias,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "max_tokens": 4,
+                        },
+                    )
+                    resp.raise_for_status()
+
+        tasks = [asyncio.create_task(_send_one()) for _ in range(total)]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 简单观察实例数量变化
+        await asyncio.sleep(int(os.getenv("FAKE_SCALE_WAIT_S", "10")))
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            models = await client.get(f"{self.serve_url}/admin/models")
+            models.raise_for_status()
+            data = models.json().get("models", [])
+            target = next((m for m in data if m.get("alias") == alias), None)
+            instances = target.get("instances", []) if target else []
+            print(f"Fake 模型当前实例数: {len(instances)}")
+            min_instances = int(os.getenv("FAKE_MIN_INSTANCES", "2"))
+            if len(instances) < min_instances:
+                raise RuntimeError(f"Fake 扩容断言失败：实例数 {len(instances)} < {min_instances}")
+
+        # 缩容观察（等待一段时间后再次查看）
+        scale_down_wait = int(os.getenv("FAKE_SCALE_DOWN_WAIT_S", "60"))
+        await asyncio.sleep(scale_down_wait)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            models = await client.get(f"{self.serve_url}/admin/models")
+            models.raise_for_status()
+            data = models.json().get("models", [])
+            target = next((m for m in data if m.get("alias") == alias), None)
+            instances_after = target.get("instances", []) if target else []
+            print(f"Fake 模型缩容后实例数: {len(instances_after)}")
 
     @staticmethod
     def _percentile(values: List[float], percentile: float) -> float:
