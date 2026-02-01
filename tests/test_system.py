@@ -1,5 +1,6 @@
 """系统测试（Serve + Worker 协作版）"""
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -103,6 +104,31 @@ class SystemTester:
             return False
         return False
 
+    def _load_image_data_uris(self) -> List[str]:
+        paths_raw = os.getenv("IMAGE_PATHS", "")
+        if paths_raw:
+            paths = [p.strip() for p in paths_raw.split(",") if p.strip()]
+        else:
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            default_path = os.path.join("/root/Code/video_anomaly_analysis_system/model_pool_serve/demo.png")
+            paths = [default_path] if os.path.exists(default_path) else []
+        if not paths:
+            raise RuntimeError("未找到可用图片，请设置 IMAGE_PATHS")
+
+        data_uris: List[str] = []
+        for path in paths:
+            with open(path, "rb") as f:
+                encoded = base64.b64encode(f.read()).decode("ascii")
+            ext = os.path.splitext(path)[1].lower()
+            if ext in {".png"}:
+                mime = "image/png"
+            elif ext in {".jpg", ".jpeg"}:
+                mime = "image/jpeg"
+            else:
+                mime = "application/octet-stream"
+            data_uris.append(f"data:{mime};base64,{encoded}")
+        return data_uris
+
     async def force_sleep(self, level: int) -> None:
         instance = await self._get_instance_record()
         instance_alias = instance.get("instance_alias")
@@ -119,18 +145,29 @@ class SystemTester:
 
     async def run(self) -> None:
         await self.test_health()
-        # await self.register_model()
+        await self.register_model()
         await self.list_info()
 
-        # print("\n=== 一次文本调用 ===")
-        # ok = await self.chat_with_retry(retries=3, wait_s=60)
-        # if not ok:
-        #     raise RuntimeError("首次文本调用失败")
+        print("\n=== 一次文本调用 ===")
+        ok = await self.chat_with_retry(retries=3, wait_s=60)
+        if not ok:
+            raise RuntimeError("首次文本调用失败")
 
-        if os.getenv("RUN_AUTOSCALER_TEST", "0") == "1":
+        # 真实模型扩缩容测试（并发/突发请求驱动）
+        if os.getenv("RUN_REAL_AUTOSCALER_TEST", "1") == "1":
+            await self.real_autoscaler_test()
+
+        # 图片列表 + 流式回复测试
+        if os.getenv("RUN_IMAGE_STREAM_TEST", "0") == "1":
+            await self.image_list_stream_test()
+
+        # autoscaler 唤醒测试（强制 sleep 后观察唤醒恢复）
+        run_wake_test = os.getenv("RUN_AUTOSCALER_WAKE_TEST", "0") == "1"
+        run_wake_test = run_wake_test or os.getenv("RUN_AUTOSCALER_TEST", "0") == "1"
+        if run_wake_test:
             await self.autoscaler_wake_test()
 
-        if os.getenv("RUN_FAKE_AUTOSCALER_TEST", "1") == "1":
+        if os.getenv("RUN_FAKE_AUTOSCALER_TEST", "0") == "1":
             await self.fake_autoscaler_test()
 
         if os.getenv("RUN_OVERLOAD_TEST", "0") == "1":
@@ -229,6 +266,123 @@ class SystemTester:
             instances_after = target.get("instances", []) if target else []
             print(f"Fake 模型缩容后实例数: {len(instances_after)}")
 
+    async def real_autoscaler_test(self) -> None:
+        print("\n=== 真实模型弹性调度测试 ===")
+        ok = await self.chat_with_retry(retries=3, wait_s=60)
+        if not ok:
+            raise RuntimeError("真实模型未就绪，无法执行弹性调度测试")
+
+        total = int(os.getenv("REAL_BURST_REQUESTS", "16"))
+        concurrency = int(os.getenv("REAL_BURST_CONCURRENCY", "4"))
+        max_tokens = int(os.getenv("REAL_BURST_MAX_TOKENS", "128"))
+        test_duration_s = int(os.getenv("REAL_TEST_DURATION_S", "600"))
+        pause_s = float(os.getenv("REAL_BURST_PAUSE_S", "2"))
+        prompt_len = max(32, max_tokens)
+        prompt = os.urandom(prompt_len // 2).hex()
+        payload = {
+            "model": self.model_alias,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+        }
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _send_one() -> None:
+            async with sem:
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    resp = await client.post(f"{self.serve_url}/v1/chat/completions", json=payload)
+                    if resp.status_code == 503:
+                        return
+                    resp.raise_for_status()
+
+        print(f"真实模型弹性调度测试持续 {test_duration_s}s ...")
+        end_time = time.time() + test_duration_s
+        while time.time() < end_time:
+            tasks = [asyncio.create_task(_send_one()) for _ in range(total)]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if pause_s > 0:
+                await asyncio.sleep(pause_s)
+
+        await asyncio.sleep(int(os.getenv("REAL_SCALE_WAIT_S", "10")))
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            models = await client.get(f"{self.serve_url}/admin/models")
+            models.raise_for_status()
+            data = models.json().get("models", [])
+            target = next((m for m in data if m.get("alias") == self.model_alias), None)
+            instances = target.get("instances", []) if target else []
+            print(f"真实模型当前实例数: {len(instances)}")
+            min_instances = int(os.getenv("REAL_MIN_INSTANCES", "1"))
+            if len(instances) < min_instances:
+                raise RuntimeError(f"真实模型扩容断言失败：实例数 {len(instances)} < {min_instances}")
+
+        scale_down_wait = int(os.getenv("REAL_SCALE_DOWN_WAIT_S", "60"))
+        await asyncio.sleep(scale_down_wait)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            models = await client.get(f"{self.serve_url}/admin/models")
+            models.raise_for_status()
+            data = models.json().get("models", [])
+            target = next((m for m in data if m.get("alias") == self.model_alias), None)
+            instances_after = target.get("instances", []) if target else []
+            print(f"真实模型缩容后实例数: {len(instances_after)}")
+
+    async def image_list_stream_test(self) -> None:
+        print("\n=== 图片列表流式回复测试 ===")
+        data_uris = self._load_image_data_uris()
+        content = [{"type": "text", "text": "请描述这些图片的主要内容。"}]
+        for uri in data_uris:
+            content.append({"type": "image_url", "image_url": {"url": uri}})
+
+        payload = {
+            "model": self.model_alias,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": int(os.getenv("IMAGE_STREAM_MAX_TOKENS", "128")),
+            "stream": True,
+        }
+
+        retries = int(os.getenv("IMAGE_STREAM_RETRY_COUNT", "3"))
+        wait_s = int(os.getenv("IMAGE_STREAM_RETRY_WAIT_S", "60"))
+        for attempt in range(retries + 1):
+            timeout = httpx.Timeout(None)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.serve_url}/v1/chat/completions",
+                    json=payload,
+                ) as resp:
+                    if resp.status_code == 503:
+                        body = await resp.aread()
+                        try:
+                            data = json.loads(body.decode("utf-8"))
+                        except json.JSONDecodeError:
+                            data = {}
+                        if data.get("error", {}).get("code") == "model_not_ready":
+                            if attempt == retries:
+                                raise RuntimeError(f"图片流式测试失败：模型未就绪 {data}")
+                            print(f"⚠️ 模型未就绪，{wait_s}s 后重试")
+                            await asyncio.sleep(wait_s)
+                            continue
+                    resp.raise_for_status()
+
+                    text = ""
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line.split("data:", 1)[1].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+                        if delta:
+                            text += delta
+                    if not text:
+                        raise RuntimeError("图片流式回复为空")
+                    print(f"✓ 图片流式回复: {text}")
+                    return
+
     @staticmethod
     def _percentile(values: List[float], percentile: float) -> float:
         if not values:
@@ -300,7 +454,7 @@ class SystemTester:
 
 async def main() -> None:
     serve_url = os.getenv("SERVE_URL") or (sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000")
-    worker_url = os.getenv("WORKER_URL") or (sys.argv[2] if len(sys.argv) > 2 else "http://localhost:7000")
+    worker_url = os.getenv("WORKER_URL") or (sys.argv[2] if len(sys.argv) > 2 else "http://100.66.213.127:7000")
     model_alias = os.getenv("MODEL_ALIAS", "qwen3-vl-2b")
     model_name = os.getenv("MODEL_NAME", "Qwen/Qwen3-VL-2B-Instruct")
     gpu_memory_gb = float(os.getenv("GPU_MEMORY_GB", "12.0"))

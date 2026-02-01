@@ -375,6 +375,7 @@ class WorkerRegistryCore:
         fake_delay: Optional[float] = None,
         fake_delay_ms: Optional[int] = None,
         fake_capacity: Optional[int] = None,
+        min_replicas: Optional[int] = None,
     ) -> Dict:
         if not alias or not model_name:
             return {"status": "error", "message": "alias and model_name are required"}
@@ -406,6 +407,7 @@ class WorkerRegistryCore:
                     "fake_delay": fake_delay,
                     "fake_delay_ms": fake_delay_ms,
                     "fake_capacity": fake_capacity,
+                    "min_replicas": min_replicas,
                 }
 
         worker, device = self._select_worker(gpu_memory_gb, worker_id)
@@ -769,6 +771,7 @@ class RouterManagerServe(WorkerRegistryCore):
             fake_delay=body.get("fake_delay"),
             fake_delay_ms=body.get("fake_delay_ms"),
             fake_capacity=body.get("fake_capacity"),
+            min_replicas=body.get("min_replicas"),
         )
 
     @fastapi_app.delete("/admin/models/{alias}")

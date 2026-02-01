@@ -15,6 +15,7 @@ import asyncio
 import logging
 import time
 import os
+import math
 import torch
 from enum import Enum
 from typing import Dict, Optional, AsyncIterator
@@ -896,6 +897,26 @@ class VLLMManager:
         sleep_level = self.sleep_levels.get(alias, SleepLevel.ACTIVE)
         metrics = self._latency_metrics.get(alias, {})
         
+        capacity = None
+        max_concurrency = None
+        if alias in self.fake_instances:
+            capacity = self.fake_instances[alias].capacity
+            max_concurrency = float(capacity)
+        else:
+            engine = self.engines.get(alias)
+            if engine is not None:
+                try:
+                    vllm_config = engine.vllm_config
+                    num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks
+                    block_size = vllm_config.cache_config.block_size
+                    max_model_len = vllm_config.model_config.max_model_len
+                    if num_gpu_blocks and block_size and max_model_len:
+                        max_concurrency = (num_gpu_blocks * block_size) / max_model_len
+                        capacity = max(1, int(math.floor(max_concurrency)))
+                except Exception:
+                    capacity = None
+                    max_concurrency = None
+
         return {
             "alias": alias,
             "status": instance.status.value,
@@ -911,7 +932,8 @@ class VLLMManager:
             "e2e_last": metrics.get("e2e_last"),
             "e2e_avg": metrics.get("e2e_avg"),
             "request_count": metrics.get("count", 0),
-            "capacity": self.fake_instances.get(alias).capacity if alias in self.fake_instances else None,
+            "capacity": capacity,
+            "max_concurrency": max_concurrency,
             "is_fake": alias in self.fake_instances,
         }
     

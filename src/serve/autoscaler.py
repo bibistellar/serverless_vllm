@@ -101,6 +101,7 @@ class LoadBasedAutoscaler:
                         if resp.status_code != 200:
                             continue
                         status = resp.json()
+                        status_value = str(status.get("status", "")).lower()
                         inflight = int(status.get("inflight_requests", 0))
                         sleep_level = int(status.get("sleep_level_value", 0))
                         e2e_avg = status.get("e2e_avg")
@@ -122,6 +123,9 @@ class LoadBasedAutoscaler:
                             instance["request_count"] = request_count
                             if "status" in status:
                                 instance["status"] = status["status"]
+                            if status_value in {"error", "stopped"}:
+                                instance["active"] = False
+                                instance["pending_active"] = False
                             ready = registry._is_instance_ready(instance)
                             if instance.get("active") and not ready:
                                 instance["active"] = False
@@ -147,12 +151,31 @@ class LoadBasedAutoscaler:
             ready_not_active = [i for i in instances if (not i.get("active")) and registry._is_instance_ready(i)]
             pending = [
                 i for i in instances
-                if i.get("pending_active") or str(i.get("status", "")).lower() == "starting"
+                if (i.get("pending_active") or str(i.get("status", "")).lower() == "starting")
+                and str(i.get("status", "")).lower() not in {"error", "stopped"}
             ]
-            if len(active) < self.min_replicas and ready_not_active:
-                for inst in ready_not_active[: self.min_replicas - len(active)]:
+            min_replicas = config.get("min_replicas", self.min_replicas)
+            try:
+                min_replicas = max(0, int(min_replicas))
+            except (TypeError, ValueError):
+                min_replicas = self.min_replicas
+            if len(active) < min_replicas and ready_not_active:
+                for inst in ready_not_active[: min_replicas - len(active)]:
                     inst["active"] = True
             active = [i for i in instances if i.get("active")]
+            if len(active) < min_replicas:
+                if pending:
+                    _print(
+                        f"autoscaler: model={model_alias} active={len(active)} "
+                        f"pending={len(pending)} min_replicas={min_replicas} -> wait pending"
+                    )
+                    continue
+                _print(
+                    f"autoscaler: model={model_alias} active={len(active)} "
+                    f"pending={len(pending)} min_replicas={min_replicas} -> scale up"
+                )
+                await self._scale_up(registry, model_alias, instances, config, time.time())
+                continue
 
             now = time.time()
             await self._ensure_latency_baseline(registry, model_alias, active)
@@ -206,7 +229,7 @@ class LoadBasedAutoscaler:
                     f"samples={sample_count} "
                     f"< {self.scale_down_latency_threshold:.3f}s -> scale down"
                 )
-                await self._scale_down(registry, model_alias, instances, config, now)
+                await self._scale_down(registry, model_alias, instances, config, now, min_replicas)
 
     def _avg_latency(self, active: List[Dict], now: float) -> tuple[float, int]:
         latencies = []
@@ -308,7 +331,11 @@ class LoadBasedAutoscaler:
             )
             return
 
-        if len(instances) >= self.max_replicas:
+        effective_instances = [
+            i for i in instances
+            if str(i.get("status", "")).lower() not in {"error", "stopped"}
+        ]
+        if len(effective_instances) >= self.max_replicas:
             _print(f"autoscaler: model={model_alias} reached max_replicas={self.max_replicas}")
             return
 
@@ -323,6 +350,7 @@ class LoadBasedAutoscaler:
         instances: List[Dict],
         config: Dict,
         now: float,
+        min_replicas: int,
     ) -> None:
         last = self._last_scale_down.get(model_alias, 0.0)
         if now - last < self.scale_down_cooldown_s:
@@ -333,8 +361,8 @@ class LoadBasedAutoscaler:
             return
 
         active = [i for i in instances if i.get("active")]
-        if len(active) <= self.min_replicas:
-            _print(f"autoscaler: model={model_alias} at min_replicas={self.min_replicas}")
+        if len(active) <= min_replicas:
+            _print(f"autoscaler: model={model_alias} at min_replicas={min_replicas}")
             return
 
         idle = [i for i in active if int(i.get("inflight_requests", 0)) == 0]
