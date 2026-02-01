@@ -34,6 +34,9 @@ class LoadBasedAutoscaler:
         scale_up_cooldown_s: float = 30.0,
         scale_down_cooldown_s: float = 30.0,
         latency_sample_window_s: float = 30.0,
+        baseline_latency_multiplier: float = 2.0,
+        baseline_max_tokens: int = 16,
+        baseline_timeout_s: float = 30.0,
     ) -> None:
         self.instance_capacity = max(1, instance_capacity)
         self.min_replicas = max(1, min_replicas)
@@ -45,8 +48,13 @@ class LoadBasedAutoscaler:
         self.scale_up_cooldown_s = scale_up_cooldown_s
         self.scale_down_cooldown_s = scale_down_cooldown_s
         self.latency_sample_window_s = latency_sample_window_s
+        self.baseline_latency_multiplier = baseline_latency_multiplier
+        self.baseline_max_tokens = baseline_max_tokens
+        self.baseline_timeout_s = baseline_timeout_s
         self._last_scale_up: Dict[str, float] = {}
         self._last_scale_down: Dict[str, float] = {}
+        self._scale_up_thresholds: Dict[str, float] = {}
+        self._baseline_pending: set[str] = set()
         self._task: Optional[asyncio.Task] = None
 
     def start(self, registry) -> None:
@@ -147,6 +155,10 @@ class LoadBasedAutoscaler:
             active = [i for i in instances if i.get("active")]
 
             now = time.time()
+            await self._ensure_latency_baseline(registry, model_alias, active)
+            scale_up_threshold = self._scale_up_thresholds.get(
+                model_alias, self.scale_up_latency_threshold
+            )
             avg_latency, sample_count = self._avg_latency(active, now)
 
             if not active:
@@ -164,7 +176,7 @@ class LoadBasedAutoscaler:
                 await self._scale_up(registry, model_alias, instances, config, now)
                 continue
 
-            if avg_latency > self.scale_up_latency_threshold:
+            if avg_latency > scale_up_threshold:
                 if sample_count == 0:
                     _print(
                         f"autoscaler: model={model_alias} active={len(active)} "
@@ -184,7 +196,7 @@ class LoadBasedAutoscaler:
                     f"autoscaler: model={model_alias} active={len(active)} "
                     f"pending={len(pending)} avg_latency={avg_latency:.3f}s "
                     f"samples={sample_count} "
-                    f"> {self.scale_up_latency_threshold:.3f}s -> scale up"
+                    f"> {scale_up_threshold:.3f}s -> scale up"
                 )
                 await self._scale_up(registry, model_alias, instances, config, now)
             elif avg_latency < self.scale_down_latency_threshold:
@@ -214,6 +226,56 @@ class LoadBasedAutoscaler:
         if not latencies:
             return 0.0, 0
         return sum(latencies) / len(latencies), len(latencies)
+
+    async def _ensure_latency_baseline(self, registry, model_alias: str, active: List[Dict]) -> None:
+        if model_alias in self._scale_up_thresholds or model_alias in self._baseline_pending:
+            return
+        if not active:
+            return
+        self._baseline_pending.add(model_alias)
+        try:
+            candidate = active[0]
+            latency = await self._measure_baseline_latency(registry, candidate, model_alias)
+            if latency is None:
+                _print(f"autoscaler: model={model_alias} baseline measure failed")
+                return
+            threshold = latency * self.baseline_latency_multiplier
+            self._scale_up_thresholds[model_alias] = threshold
+            _print(
+                f"autoscaler: model={model_alias} baseline={latency:.3f}s "
+                f"-> scale_up_threshold={threshold:.3f}s"
+            )
+        finally:
+            self._baseline_pending.discard(model_alias)
+
+    async def _measure_baseline_latency(
+        self,
+        registry,
+        instance: Dict,
+        model_alias: str,
+    ) -> Optional[float]:
+        worker_url = instance.get("worker_url") or instance.get("control_url")
+        inst_alias = instance.get("instance_alias")
+        if not worker_url or not inst_alias:
+            return None
+        payload = {
+            "model": model_alias,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": self.baseline_max_tokens,
+            "stream": False,
+        }
+        try:
+            start = time.perf_counter()
+            async with httpx.AsyncClient(timeout=self.baseline_timeout_s) as client:
+                resp = await client.post(
+                    f"{worker_url}/proxy/{inst_alias}/v1/chat/completions",
+                    json=payload,
+                )
+            if resp.status_code >= 400:
+                return None
+            return time.perf_counter() - start
+        except Exception:
+            return None
 
     async def _scale_up(
         self,

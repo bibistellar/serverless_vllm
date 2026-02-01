@@ -59,6 +59,9 @@ class WorkerRegistryCore:
         scale_up_cooldown_s = float(os.getenv("SCALE_UP_COOLDOWN", "30"))
         scale_down_cooldown_s = float(os.getenv("SCALE_DOWN_COOLDOWN", "30"))
         latency_sample_window_s = float(os.getenv("SCALE_LATENCY_WINDOW_S", "30"))
+        baseline_latency_multiplier = float(os.getenv("SCALE_BASELINE_MULTIPLIER", "2.0"))
+        baseline_max_tokens = int(os.getenv("SCALE_BASELINE_MAX_TOKENS", "16"))
+        baseline_timeout_s = float(os.getenv("SCALE_BASELINE_TIMEOUT_S", "30"))
         self.autoscaler = LoadBasedAutoscaler(
             instance_capacity=instance_capacity,
             min_replicas=min_replicas,
@@ -70,6 +73,9 @@ class WorkerRegistryCore:
             scale_up_cooldown_s=scale_up_cooldown_s,
             scale_down_cooldown_s=scale_down_cooldown_s,
             latency_sample_window_s=latency_sample_window_s,
+            baseline_latency_multiplier=baseline_latency_multiplier,
+            baseline_max_tokens=baseline_max_tokens,
+            baseline_timeout_s=baseline_timeout_s,
         )
         self.autoscaler.start(self)
 

@@ -155,8 +155,10 @@ print(resp.choices[0].message.content)
 - 先采用 **平均分发**（后续如需优化再讨论）。
 
 **扩容逻辑（以时延为主）**
-- autoscaler 定期采样实例 E2E 平均延迟（或滑动平均）。
-- 当平均延迟 **高于阈值**（暂定 `SCALE_UP_LATENCY_THRESHOLD = 5s`）时触发扩容。
+- autoscaler 定期采样实例 E2E 平均延迟（或滑动平均），只统计 **近一段时间内有请求** 的样本（`SCALE_LATENCY_WINDOW_S`）。
+- 每个模型首次就绪后自动发起一次 **基线请求**，测得延迟后将 **扩容阈值** 设置为 `baseline * SCALE_BASELINE_MULTIPLIER`（默认 `2.0`）。
+- 若基线请求失败，则使用固定阈值 `SCALE_UP_LATENCY_THRESHOLD` 作为兜底。
+- 当平均延迟 **高于阈值** 时触发扩容；若没有近期样本则跳过扩容。
 - 每次扩容 **只增加一个实例**，并在扩容后进入冷却时间。
 - 扩容顺序：先唤醒 SLEEP_1 → SLEEP_2 → UNLOADED，若仍不足再启动新实例并加入 ACTIVE 列表。
 
@@ -167,7 +169,7 @@ print(resp.choices[0].message.content)
 - autoscaler 从 ACTIVE 列表移除实例（不强制 sleep，由 Worker 自然降级）。
 
 **说明**
-- 目前缩容/扩容阈值为固定值，后续可再引入自适应或结合负载指标。
+- 扩容阈值支持基线自适应，缩容阈值仍为固定值，后续可再结合负载指标。
 ## 假模型（调度压测）
 
 注册 fake 模型：
