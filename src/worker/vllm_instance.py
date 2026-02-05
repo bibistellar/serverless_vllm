@@ -403,6 +403,7 @@ class VLLMManager:
             )
             logger.info("✅ AutoProcessor loaded for '%s'", alias)
 
+            enable_sleep_mode = os.getenv("VLLM_ENABLE_SLEEP_MODE", "1") == "1"
             engine_args = AsyncEngineArgs(
                 model=model_path,
                 mm_encoder_tp_mode="data",
@@ -410,6 +411,7 @@ class VLLMManager:
                 tensor_parallel_size=tensor_parallel_size,
                 gpu_memory_utilization=gpu_memory_utilization,
                 max_model_len=max_model_len,
+                enable_sleep_mode=enable_sleep_mode,
                 seed=0,
                 trust_remote_code=True,
             )

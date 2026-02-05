@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 from typing import Dict, List, Optional
+from collections import Counter
 
 import httpx
 
@@ -60,6 +61,83 @@ class LoadBasedAutoscaler:
     def start(self, registry) -> None:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._loop(registry))
+
+    def _capacity_stats(self, instances: List[Dict]) -> tuple[int, float, int]:
+        caps: List[int] = []
+        unknown = 0
+        for inst in instances:
+            cap = inst.get("capacity")
+            try:
+                cap = int(cap)
+            except (TypeError, ValueError):
+                cap = None
+            if cap is None or cap <= 0:
+                unknown += 1
+                cap = self.instance_capacity
+            caps.append(cap)
+        total = sum(caps)
+        avg = total / len(caps) if caps else 0.0
+        return total, avg, unknown
+
+    def _format_stats(
+        self,
+        instances: List[Dict],
+        active: List[Dict],
+        pending: List[Dict],
+        min_replicas: int,
+        avg_latency: float,
+        sample_count: int,
+        scale_up_threshold: float,
+        load_active: float,
+        scale_up_load_threshold: float,
+        scale_down_load_threshold: float,
+    ) -> str:
+        status_counts = Counter(str(i.get("status", "unknown")).lower() for i in instances)
+        sleep_counts = Counter(int(i.get("sleep_level_value", -1)) for i in instances)
+        inflight_all = sum(int(i.get("inflight_requests", 0)) for i in instances)
+        inflight_active = sum(int(i.get("inflight_requests", 0)) for i in active)
+        load_avg = 0.0
+        if active:
+            load_avg = sum(float(i.get("load", 0.0)) for i in active) / len(active)
+        cap_all_sum, cap_all_avg, cap_all_unknown = self._capacity_stats(instances)
+        cap_active_sum, cap_active_avg, cap_active_unknown = self._capacity_stats(active)
+
+        per_instance = []
+        for inst in instances:
+            alias = inst.get("instance_alias") or inst.get("alias") or "unknown"
+            status = str(inst.get("status", "unknown")).lower()
+            sleep = inst.get("sleep_level_value")
+            inflight = int(inst.get("inflight_requests", 0))
+            load = inst.get("load")
+            try:
+                load = float(load) if load is not None else 0.0
+            except (TypeError, ValueError):
+                load = 0.0
+            cap = inst.get("capacity")
+            try:
+                cap = int(cap)
+            except (TypeError, ValueError):
+                cap = self.instance_capacity
+            per_instance.append(
+                f"{alias}(status={status},sleep={sleep},cap={cap},inflight={inflight},load={load:.2f},"
+                f"active={int(bool(inst.get('active')))},pending={int(bool(inst.get('pending_active')))}"
+                ")"
+            )
+        per_instance_str = "; ".join(per_instance)
+
+        status_str = ",".join(f"{k}={v}" for k, v in sorted(status_counts.items()))
+        sleep_str = ",".join(f"{k}={v}" for k, v in sorted(sleep_counts.items()))
+        return (
+            f"min={min_replicas} "
+            f"lat={avg_latency:.3f}s samples={sample_count} th={scale_up_threshold:.3f}s "
+            f"load_active={load_active:.2f} th_up={scale_up_load_threshold:.2f} "
+            f"th_down={scale_down_load_threshold:.2f} "
+            f"cap_active={cap_active_sum} avg={cap_active_avg:.1f} unknown={cap_active_unknown} "
+            f"cap_all={cap_all_sum} avg={cap_all_avg:.1f} unknown={cap_all_unknown} "
+            f"inflight_active={inflight_active} inflight_all={inflight_all} "
+            f"load_avg={load_avg:.2f} status[{status_str}] sleep[{sleep_str}] "
+            f"pending={len(pending)} instances[{per_instance_str}]"
+        )
 
     async def select_instance(self, registry, model_alias: str) -> Optional[Dict]:
         """Deprecated: routing handled by ACTIVE list in Serve."""
@@ -164,70 +242,91 @@ class LoadBasedAutoscaler:
                     inst["active"] = True
             active = [i for i in instances if i.get("active")]
             if len(active) < min_replicas:
+                detail = self._format_stats(
+                    instances,
+                    active,
+                    pending,
+                    min_replicas,
+                    0.0,
+                    0,
+                    0.0,
+                    0.0,
+                    float(registry.scale_up_load_threshold),
+                    float(registry.scale_down_load_threshold),
+                )
                 if pending:
                     _print(
                         f"autoscaler: model={model_alias} active={len(active)} "
-                        f"pending={len(pending)} min_replicas={min_replicas} -> wait pending"
+                        f"pending={len(pending)} min_replicas={min_replicas} {detail} -> wait pending"
                     )
                     continue
                 _print(
                     f"autoscaler: model={model_alias} active={len(active)} "
-                    f"pending={len(pending)} min_replicas={min_replicas} -> scale up"
+                    f"pending={len(pending)} min_replicas={min_replicas} {detail} -> scale up"
                 )
                 await self._scale_up(registry, model_alias, instances, config, time.time())
                 continue
 
             now = time.time()
-            await self._ensure_latency_baseline(registry, model_alias, active)
             scale_up_threshold = self._scale_up_thresholds.get(
                 model_alias, self.scale_up_latency_threshold
             )
             avg_latency, sample_count = self._avg_latency(active, now)
+            inflight_active = sum(int(i.get("inflight_requests", 0)) for i in active)
+            cap_active_sum, _, _ = self._capacity_stats(active)
+            load_active = (inflight_active / cap_active_sum) if cap_active_sum > 0 else 0.0
+            scale_up_load_threshold = float(registry.scale_up_load_threshold)
+            scale_down_load_threshold = float(registry.scale_down_load_threshold)
+            detail = self._format_stats(
+                instances,
+                active,
+                pending,
+                min_replicas,
+                avg_latency,
+                sample_count,
+                scale_up_threshold,
+                load_active,
+                scale_up_load_threshold,
+                scale_down_load_threshold,
+            )
 
             if not active:
                 if pending:
                     _print(
                         f"autoscaler: model={model_alias} active=0 "
                         f"pending={len(pending)} avg_latency={avg_latency:.3f}s "
-                        f"samples={sample_count} -> wait pending"
+                        f"samples={sample_count} {detail} -> wait pending"
                     )
                     continue
                 _print(
                     f"autoscaler: model={model_alias} active=0 pending=0 "
-                    f"avg_latency={avg_latency:.3f}s samples={sample_count} -> scale up"
+                    f"avg_latency={avg_latency:.3f}s samples={sample_count} {detail} -> scale up"
                 )
                 await self._scale_up(registry, model_alias, instances, config, now)
                 continue
 
-            if avg_latency > scale_up_threshold:
-                if sample_count == 0:
-                    _print(
-                        f"autoscaler: model={model_alias} active={len(active)} "
-                        f"pending={len(pending)} avg_latency={avg_latency:.3f}s "
-                        f"samples=0 -> skip scale up (no recent samples)"
-                    )
-                    continue
+            if load_active > scale_up_load_threshold:
                 if pending:
                     _print(
                         f"autoscaler: model={model_alias} active={len(active)} "
                         f"pending={len(pending)} avg_latency={avg_latency:.3f}s "
-                        f"samples={sample_count} "
+                        f"samples={sample_count} {detail} "
                         "-> skip scale up (pending)"
                     )
                     continue
                 _print(
                     f"autoscaler: model={model_alias} active={len(active)} "
                     f"pending={len(pending)} avg_latency={avg_latency:.3f}s "
-                    f"samples={sample_count} "
-                    f"> {scale_up_threshold:.3f}s -> scale up"
+                    f"samples={sample_count} {detail} "
+                    f"load_active>{scale_up_load_threshold:.2f} -> scale up"
                 )
                 await self._scale_up(registry, model_alias, instances, config, now)
-            elif avg_latency < self.scale_down_latency_threshold:
+            elif load_active < scale_down_load_threshold:
                 _print(
                     f"autoscaler: model={model_alias} active={len(active)} "
                     f"pending={len(pending)} avg_latency={avg_latency:.3f}s "
-                    f"samples={sample_count} "
-                    f"< {self.scale_down_latency_threshold:.3f}s -> scale down"
+                    f"samples={sample_count} {detail} "
+                    f"load_active<{scale_down_load_threshold:.2f} -> scale down"
                 )
                 await self._scale_down(registry, model_alias, instances, config, now, min_replicas)
 

@@ -273,8 +273,8 @@ class SystemTester:
             raise RuntimeError("真实模型未就绪，无法执行弹性调度测试")
 
         total = int(os.getenv("REAL_BURST_REQUESTS", "16"))
-        concurrency = int(os.getenv("REAL_BURST_CONCURRENCY", "4"))
-        max_tokens = int(os.getenv("REAL_BURST_MAX_TOKENS", "128"))
+        concurrency = int(os.getenv("REAL_BURST_CONCURRENCY", "8"))
+        max_tokens = int(os.getenv("REAL_BURST_MAX_TOKENS", "2048"))
         test_duration_s = int(os.getenv("REAL_TEST_DURATION_S", "600"))
         pause_s = float(os.getenv("REAL_BURST_PAUSE_S", "2"))
         prompt_len = max(32, max_tokens)
