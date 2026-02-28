@@ -10,9 +10,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -28,6 +29,25 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+
+BACKEND_VLLM = "vllm"
+BACKEND_LLAMA_CPP = "llama.cpp"
+SUPPORTED_BACKENDS = {BACKEND_VLLM, BACKEND_LLAMA_CPP}
+
+ROUTING_COLD = "COLD"
+ROUTING_FAST_ONLY = "FAST_ONLY"
+ROUTING_WARMING_VLLM = "WARMING_VLLM"
+ROUTING_MIXED = "MIXED"
+ROUTING_VLLM_PRIMARY = "VLLM_PRIMARY"
+ROUTING_DEGRADED_FAST = "DEGRADED_FAST"
+SUPPORTED_ROUTING_STATES = {
+    ROUTING_COLD,
+    ROUTING_FAST_ONLY,
+    ROUTING_WARMING_VLLM,
+    ROUTING_MIXED,
+    ROUTING_VLLM_PRIMARY,
+    ROUTING_DEGRADED_FAST,
+}
 
 
 class WorkerRegistryCore:
@@ -47,6 +67,7 @@ class WorkerRegistryCore:
         self.model_instances: Dict[str, list] = {}
         self.model_configs: Dict[str, Dict] = {}
         self.failure_counts: Dict[str, int] = {}
+        self.instance_capacity = max(1, int(instance_capacity))
         self._worker_replica_counters: Dict[str, int] = {}
         self._rr_counters: Dict[str, int] = {}
         self._lock = asyncio.Lock()
@@ -61,25 +82,30 @@ class WorkerRegistryCore:
         latency_sample_window_s = float(os.getenv("SCALE_LATENCY_WINDOW_S", "30"))
         self.scale_up_load_threshold = float(os.getenv("SCALE_UP_LOAD_THRESHOLD", "0.7"))
         self.scale_down_load_threshold = float(os.getenv("SCALE_DOWN_LOAD_THRESHOLD", "0.2"))
+        self.autoscaler_enabled = os.getenv("AUTOSCALER_ENABLED", "1") == "1"
         baseline_latency_multiplier = float(os.getenv("SCALE_BASELINE_MULTIPLIER", "2.0"))
         baseline_max_tokens = int(os.getenv("SCALE_BASELINE_MAX_TOKENS", "16"))
         baseline_timeout_s = float(os.getenv("SCALE_BASELINE_TIMEOUT_S", "30"))
-        self.autoscaler = LoadBasedAutoscaler(
-            instance_capacity=instance_capacity,
-            min_replicas=min_replicas,
-            max_replicas=max_replicas,
-            check_interval=scale_interval,
-            health_timeout=healthcheck_timeout,
-            scale_up_latency_threshold=scale_up_latency_threshold,
-            scale_down_latency_threshold=scale_down_latency_threshold,
-            scale_up_cooldown_s=scale_up_cooldown_s,
-            scale_down_cooldown_s=scale_down_cooldown_s,
-            latency_sample_window_s=latency_sample_window_s,
-            baseline_latency_multiplier=baseline_latency_multiplier,
-            baseline_max_tokens=baseline_max_tokens,
-            baseline_timeout_s=baseline_timeout_s,
-        )
-        self.autoscaler.start(self)
+        self.autoscaler: Optional[LoadBasedAutoscaler] = None
+        if self.autoscaler_enabled:
+            self.autoscaler = LoadBasedAutoscaler(
+                instance_capacity=self.instance_capacity,
+                min_replicas=min_replicas,
+                max_replicas=max_replicas,
+                check_interval=scale_interval,
+                health_timeout=healthcheck_timeout,
+                scale_up_latency_threshold=scale_up_latency_threshold,
+                scale_down_latency_threshold=scale_down_latency_threshold,
+                scale_up_cooldown_s=scale_up_cooldown_s,
+                scale_down_cooldown_s=scale_down_cooldown_s,
+                latency_sample_window_s=latency_sample_window_s,
+                baseline_latency_multiplier=baseline_latency_multiplier,
+                baseline_max_tokens=baseline_max_tokens,
+                baseline_timeout_s=baseline_timeout_s,
+            )
+            self.autoscaler.start(self)
+        else:
+            logger.info("Autoscaler disabled (AUTOSCALER_ENABLED=0): routing-only mode")
 
     async def register_worker(
         self,
@@ -136,7 +162,75 @@ class WorkerRegistryCore:
         self._rr_counters[alias] = (idx + 1) % len(active)
         return active[idx]
 
+    @staticmethod
+    def _normalize_routing_state(value: Optional[str]) -> str:
+        state = (value or ROUTING_FAST_ONLY).strip().upper()
+        if state not in SUPPORTED_ROUTING_STATES:
+            raise ValueError(f"unsupported routing_state: {state}")
+        return state
+
+    @staticmethod
+    def _normalize_backend_type(value: Optional[str]) -> str:
+        backend = (value or "").strip()
+        if backend not in SUPPORTED_BACKENDS:
+            raise ValueError(f"unsupported backend_type: {backend}")
+        return backend
+
+    @staticmethod
+    def _default_backend_payload(backend_type: str) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"backend_type": backend_type}
+        if backend_type == BACKEND_VLLM:
+            payload["tensor_parallel_size"] = 1
+        return payload
+
+    def _validate_backends_config(self, backends: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        if not isinstance(backends, dict) or not backends:
+            raise ValueError("backends is required and must be a non-empty object")
+
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for backend_type, cfg in backends.items():
+            backend = self._normalize_backend_type(backend_type)
+            if not isinstance(cfg, dict):
+                raise ValueError(f"backend config for {backend} must be an object")
+            model_name = cfg.get("model_name")
+            if not model_name or not isinstance(model_name, str):
+                raise ValueError(f"backends.{backend}.model_name is required")
+
+            merged = self._default_backend_payload(backend)
+            merged.update(cfg)
+            merged["backend_type"] = backend
+            if "min_replicas" in merged and merged["min_replicas"] is not None:
+                merged["min_replicas"] = max(0, int(merged["min_replicas"]))
+            if "max_replicas" in merged and merged["max_replicas"] is not None:
+                merged["max_replicas"] = max(0, int(merged["max_replicas"]))
+            normalized[backend] = merged
+
+        return normalized
+
+    @staticmethod
+    def _primary_backend_by_state(routing_state: str) -> str:
+        if routing_state in {ROUTING_FAST_ONLY, ROUTING_WARMING_VLLM, ROUTING_DEGRADED_FAST}:
+            return BACKEND_LLAMA_CPP
+        if routing_state == ROUTING_VLLM_PRIMARY:
+            return BACKEND_VLLM
+        if routing_state == ROUTING_MIXED:
+            return BACKEND_VLLM
+        return BACKEND_LLAMA_CPP
+
+    def _choose_backend_for_scale(self, config: Dict[str, Any]) -> Optional[str]:
+        backends = config.get("backends") or {}
+        if not backends:
+            return None
+        routing_state = self._normalize_routing_state(config.get("routing_state"))
+        preferred = self._primary_backend_by_state(routing_state)
+        if preferred in backends:
+            return preferred
+        return next(iter(backends.keys()), None)
+
     def _sleep_level_value(self, instance: Dict) -> int:
+        backend_type = instance.get("backend_type")
+        if backend_type == BACKEND_LLAMA_CPP:
+            return 0
         value = instance.get("sleep_level_value")
         if value is not None:
             try:
@@ -155,9 +249,12 @@ class WorkerRegistryCore:
         return 3
 
     def _is_instance_ready(self, instance: Dict) -> bool:
-        status = instance.get("status")
+        status = str(instance.get("status", "")).lower()
         if status != "running":
             return False
+        backend_type = instance.get("backend_type")
+        if backend_type == BACKEND_LLAMA_CPP:
+            return True
         return self._sleep_level_value(instance) == 0
 
     async def _probe_instance(self, instance: Dict) -> Optional[Dict]:
@@ -174,7 +271,7 @@ class WorkerRegistryCore:
         sleep_level = int(status.get("sleep_level_value", 0))
         e2e_avg = status.get("e2e_avg")
         e2e_last = status.get("e2e_last")
-        capacity = status.get("capacity") or self.autoscaler.instance_capacity
+        capacity = status.get("capacity") or self.instance_capacity
         capacity = max(1, int(capacity))
         load = min(inflight / capacity, 1.0)
         async with self._lock:
@@ -184,6 +281,8 @@ class WorkerRegistryCore:
             instance["capacity"] = capacity
             instance["e2e_avg"] = e2e_avg
             instance["e2e_last"] = e2e_last
+            if "backend_type" in status:
+                instance["backend_type"] = status["backend_type"]
             if "status" in status:
                 instance["status"] = status["status"]
         return instance
@@ -192,15 +291,52 @@ class WorkerRegistryCore:
         await self._prune_orphan_instances()
         async with self._lock:
             instances = list(self.model_instances.get(alias, []))
+            config = dict(self.model_configs.get(alias, {}))
             if not instances:
                 return None, "not_found"
-            active = [i for i in instances if i.get("active")]
+
+            if self.autoscaler_enabled:
+                active = [i for i in instances if i.get("active")]
+            else:
+                # Routing-only mode: do not depend on autoscaler-maintained active flags.
+                active = list(instances)
             if not active:
                 return None, "not_ready"
-            candidate = self._pick_active_instance(alias, active)
-        await self._probe_instance(candidate)
-        if self._is_instance_ready(candidate):
-            return candidate, "ready"
+
+            routing_state = self._normalize_routing_state(config.get("routing_state"))
+            mix_weight = int(config.get("mix_weight", 50) or 50)
+            mix_weight = max(0, min(100, mix_weight))
+
+            fast_active = [i for i in active if i.get("backend_type") == BACKEND_LLAMA_CPP]
+            slow_active = [i for i in active if i.get("backend_type") == BACKEND_VLLM]
+
+            candidate_pools: List[tuple[str, List[Dict[str, Any]]]] = []
+            if routing_state in {ROUTING_FAST_ONLY, ROUTING_WARMING_VLLM, ROUTING_DEGRADED_FAST}:
+                candidate_pools = [("fast", fast_active), ("slow", slow_active), ("all", active)]
+            elif routing_state == ROUTING_VLLM_PRIMARY:
+                candidate_pools = [("slow", slow_active), ("fast", fast_active), ("all", active)]
+            elif routing_state == ROUTING_MIXED:
+                choose_slow = random.random() < (mix_weight / 100.0)
+                if choose_slow:
+                    candidate_pools = [("slow", slow_active), ("fast", fast_active), ("all", active)]
+                else:
+                    candidate_pools = [("fast", fast_active), ("slow", slow_active), ("all", active)]
+            else:
+                candidate_pools = [("all", active)]
+
+        for tag, pool in candidate_pools:
+            if not pool:
+                continue
+            # Try the whole pool to avoid missing a ready instance by chance.
+            for _ in range(len(pool)):
+                candidate = self._pick_active_instance(f"{alias}:{tag}", pool)
+                await self._probe_instance(candidate)
+                if self._is_instance_ready(candidate):
+                    if not self.autoscaler_enabled:
+                        async with self._lock:
+                            candidate["active"] = True
+                            candidate["pending_active"] = False
+                    return candidate, "ready"
         return None, "not_ready"
 
     def _iter_worker_devices(self, worker: Dict) -> List[Dict]:
@@ -272,7 +408,6 @@ class WorkerRegistryCore:
         total_memory = float(device.get("total_memory_gb", 0.0) or 0.0)
         if total_memory <= 0:
             raise ValueError("worker total_memory_gb unavailable")
-        print(f"Computing GPU utilization: gpu_memory_gb={gpu_memory_gb}, total_memory={total_memory}")
         utilization = gpu_memory_gb / total_memory
         return max(0.0, min(1.0, utilization))
 
@@ -308,45 +443,71 @@ class WorkerRegistryCore:
         async with httpx.AsyncClient(timeout=30.0) as client:
             await client.post(f"{worker_url}/instances/{inst_alias}/sleep", json={"level": level})
 
-    async def _start_new_instance(self, model_alias: str, config: Dict) -> None:
-        gpu_memory_gb = config.get("gpu_memory_gb")
-        fake = config.get("fake")
-        if not fake and gpu_memory_gb is None:
+    async def _start_new_instance(
+        self,
+        model_alias: str,
+        config: Dict[str, Any],
+        *,
+        backend_type: Optional[str] = None,
+        worker_id: Optional[str] = None,
+    ) -> None:
+        backends = config.get("backends") or {}
+        selected_backend = backend_type or self._choose_backend_for_scale(config)
+        if not selected_backend:
             return
-        worker, device = self._select_worker(gpu_memory_gb, None)
+        backend_cfg = backends.get(selected_backend)
+        if not isinstance(backend_cfg, dict):
+            return
+
+        gpu_memory_gb = backend_cfg.get("gpu_memory_gb")
+        fake = bool(backend_cfg.get("fake"))
+        if not fake and selected_backend == BACKEND_VLLM and gpu_memory_gb is None:
+            return
+
+        worker, device = self._select_worker(gpu_memory_gb, worker_id)
         if not worker and fake:
-            worker = next(iter(self.workers.values()), None)
+            worker = self.workers.get(worker_id) if worker_id else next(iter(self.workers.values()), None)
             device = None
         if not worker:
             return
+
+        payload: Dict[str, Any] = {
+            "backend_type": selected_backend,
+            "model_name": backend_cfg.get("model_name"),
+            "model_path": backend_cfg.get("model_path"),
+            "max_model_len": backend_cfg.get("max_model_len"),
+            "fake": backend_cfg.get("fake"),
+            "fake_response": backend_cfg.get("fake_response"),
+            "fake_delay": backend_cfg.get("fake_delay"),
+            "fake_delay_ms": backend_cfg.get("fake_delay_ms"),
+            "fake_capacity": backend_cfg.get("fake_capacity"),
+        }
+
+        if selected_backend == BACKEND_VLLM:
+            payload["tensor_parallel_size"] = backend_cfg.get("tensor_parallel_size", 1)
+            payload["gpu_memory_utilization"] = self._compute_gpu_utilization(
+                device,
+                float(gpu_memory_gb or 0.0),
+            )
+        else:
+            payload["llama_filename"] = backend_cfg.get("llama_filename")
+            payload["llama_mmproj_path"] = backend_cfg.get("llama_mmproj_path")
+            payload["llama_n_gpu_layers"] = backend_cfg.get("llama_n_gpu_layers", -1)
+
         control_url = worker["worker_url"]
         instance_alias = self._next_instance_alias(worker["worker_id"], model_alias)
-        if gpu_memory_gb is None:
-            gpu_memory_gb = 0.0
         instance_info = await self._start_instance_on_worker(
             worker_url=control_url,
             instance_alias=instance_alias,
-            payload={
-                "model_name": config.get("model_name"),
-                "model_path": config.get("model_path"),
-                "gpu_memory_utilization": self._compute_gpu_utilization(
-                    device,
-                    gpu_memory_gb,
-                ),
-                "max_model_len": config.get("max_model_len"),
-                "tensor_parallel_size": config.get("tensor_parallel_size", 1),
-                "fake": config.get("fake"),
-                "fake_response": config.get("fake_response"),
-                "fake_delay": config.get("fake_delay"),
-                "fake_delay_ms": config.get("fake_delay_ms"),
-                "fake_capacity": config.get("fake_capacity"),
-            },
+            payload=payload,
         )
+
         route_url = worker.get("public_worker_url") or worker.get("worker_url")
         instance = {
             "model_alias": model_alias,
             "instance_alias": instance_alias,
-            "model_name": config.get("model_name"),
+            "backend_type": selected_backend,
+            "model_name": backend_cfg.get("model_name"),
             "worker_id": worker["worker_id"],
             "worker_url": route_url,
             "control_url": control_url,
@@ -356,9 +517,9 @@ class WorkerRegistryCore:
             "sleep_level_value": 0,
             "inflight_requests": 0,
             "load": 0.0,
-            "capacity": config.get("fake_capacity"),
-            "active": False,
-            "pending_active": True,
+            "capacity": instance_info.get("capacity") or backend_cfg.get("fake_capacity"),
+            "active": not self.autoscaler_enabled,
+            "pending_active": self.autoscaler_enabled,
         }
         async with self._lock:
             self.model_instances.setdefault(model_alias, []).append(instance)
@@ -366,28 +527,26 @@ class WorkerRegistryCore:
     async def register_model(
         self,
         alias: str,
-        model_name: str,
-        model_path: Optional[str] = None,
-        gpu_memory_gb: Optional[float] = None,
-        max_model_len: Optional[int] = None,
-        tensor_parallel_size: int = 1,
+        backends: Dict[str, Dict[str, Any]],
+        routing_state: str = ROUTING_FAST_ONLY,
+        mix_weight: int = 50,
         worker_id: Optional[str] = None,
-        fake: Optional[bool] = None,
-        fake_response: Optional[str] = None,
-        fake_delay: Optional[float] = None,
-        fake_delay_ms: Optional[int] = None,
-        fake_capacity: Optional[int] = None,
-        min_replicas: Optional[int] = None,
     ) -> Dict:
-        if not alias or not model_name:
-            return {"status": "error", "message": "alias and model_name are required"}
+        if not alias:
+            return {"status": "error", "message": "alias is required"}
 
-        if fake:
-            if gpu_memory_gb is None:
-                gpu_memory_gb = 0.0
-        else:
-            if gpu_memory_gb is None or gpu_memory_gb <= 0:
-                return {"status": "error", "message": "gpu_memory_gb is required for non-fake models"}
+        try:
+            normalized_backends = self._validate_backends_config(backends)
+            normalized_state = self._normalize_routing_state(routing_state)
+            normalized_mix_weight = max(0, min(100, int(mix_weight)))
+        except (ValueError, TypeError) as exc:
+            return {"status": "error", "message": str(exc)}
+
+        primary_backend = self._primary_backend_by_state(normalized_state)
+        if primary_backend not in normalized_backends:
+            if normalized_state in {ROUTING_FAST_ONLY, ROUTING_WARMING_VLLM, ROUTING_DEGRADED_FAST}:
+                return {"status": "error", "message": f"routing_state={normalized_state} requires backend {primary_backend}"}
+            primary_backend = next(iter(normalized_backends.keys()))
 
         async with self._lock:
             if alias in self.model_instances:
@@ -396,89 +555,51 @@ class WorkerRegistryCore:
                     "message": f"Model {alias} already registered",
                     "routing": self.model_instances[alias][0],
                 }
-            if alias not in self.model_configs:
-                self.model_configs[alias] = {
-                    "alias": alias,
-                    "model_name": model_name,
-                    "model_path": model_path,
-                    "gpu_memory_gb": gpu_memory_gb,
-                    "max_model_len": max_model_len,
-                    "tensor_parallel_size": tensor_parallel_size,
-                    "fake": fake,
-                    "fake_response": fake_response,
-                    "fake_delay": fake_delay,
-                    "fake_delay_ms": fake_delay_ms,
-                    "fake_capacity": fake_capacity,
-                    "min_replicas": min_replicas,
-                }
-
-        worker, device = self._select_worker(gpu_memory_gb, worker_id)
-        if not worker and fake:
-            worker = self.workers.get(worker_id) if worker_id else next(iter(self.workers.values()), None)
-            device = None
-        if not worker:
-            if gpu_memory_gb:
-                return {
-                    "status": "error",
-                    "message": f"No available worker with >= {gpu_memory_gb} GB free memory",
-                }
-            return {"status": "error", "message": "No available worker found"}
-
-        control_url = worker["worker_url"]
-        payload = {
-            "model_name": model_name,
-            "model_path": model_path,
-            "gpu_memory_utilization": self._compute_gpu_utilization(
-                device,
-                gpu_memory_gb or 0.0,
-            ),
-            "max_model_len": max_model_len,
-            "tensor_parallel_size": tensor_parallel_size,
-            "fake": fake,
-            "fake_response": fake_response,
-            "fake_delay": fake_delay,
-            "fake_delay_ms": fake_delay_ms,
-            "fake_capacity": fake_capacity,
-        }
-
-        try:
-            instance_alias = self._next_instance_alias(worker["worker_id"], alias)
-            instance_info = await self._start_instance_on_worker(
-                worker_url=control_url,
-                instance_alias=instance_alias,
-                payload=payload,
-            )
-
-            route_url = worker["public_worker_url"] or worker["worker_url"]
-            routing = {
-                "model_alias": alias,
-                "instance_alias": instance_alias,
-                "model_name": model_name,
-                "worker_id": worker["worker_id"],
-                "worker_url": route_url,
-                "control_url": control_url,
-                "vllm_port": instance_info.get("port", 0),
-                "status": instance_info.get("status"),
-                "created_at": time.time(),
-                "sleep_level_value": 0,
-                "inflight_requests": 0,
-                "load": 0.0,
-                "capacity": fake_capacity if fake_capacity is not None else None,
-                "active": False,
-                "pending_active": True,
+            self.model_configs[alias] = {
+                "alias": alias,
+                "routing_state": normalized_state,
+                "mix_weight": normalized_mix_weight,
+                "backends": normalized_backends,
             }
 
-            async with self._lock:
-                self.model_instances.setdefault(alias, []).append(routing)
+        started = 0
+        try:
+            initial_backend = self._primary_backend_by_state(normalized_state)
+            if initial_backend not in normalized_backends:
+                initial_backend = primary_backend
+            initial_cfg = normalized_backends.get(initial_backend, {})
+            initial_replicas = max(1, int(initial_cfg.get("min_replicas", 1)))
+            for _ in range(initial_replicas):
+                before = len(self.model_instances.get(alias, []))
+                await self._start_new_instance(
+                    alias,
+                    self.model_configs[alias],
+                    backend_type=initial_backend,
+                    worker_id=worker_id,
+                )
+                after = len(self.model_instances.get(alias, []))
+                if after > before:
+                    started += 1
 
+            if started == 0:
+                return {
+                    "status": "error",
+                    "message": f"Failed to start initial instances for {alias}",
+                }
+
+            async with self._lock:
+                routing = self.model_instances.get(alias, [{}])[0]
             return {
                 "status": "success",
-                "message": f"Model {alias} instance {instance_alias} registered",
+                "message": f"Model {alias} registered with {started} instance(s)",
                 "routing": routing,
             }
         except Exception as exc:
-            logger.error("Failed to start instance on worker %s: %s", selected_worker_id, exc)
-            return {"status": "error", "message": f"Failed to start instance: {exc}"}
+            logger.error("Failed to register model %s: %s", alias, exc)
+            async with self._lock:
+                self.model_instances.pop(alias, None)
+                self.model_configs.pop(alias, None)
+            return {"status": "error", "message": f"Failed to register model: {exc}"}
 
     async def unregister_model(self, alias: str) -> Dict:
         instances = self.model_instances.get(alias)
@@ -511,6 +632,7 @@ class WorkerRegistryCore:
             "service": "serve",
             "workers": len(self.workers),
             "models": len(self.model_instances),
+            "autoscaler_enabled": self.autoscaler_enabled,
         }
 
     async def _prune_orphan_instances(self) -> None:
@@ -762,18 +884,10 @@ class RouterManagerServe(WorkerRegistryCore):
         body = await request.json()
         return await self.register_model(
             alias=body.get("alias"),
-            model_name=body.get("model_name"),
-            model_path=body.get("model_path"),
-            gpu_memory_gb=body.get("gpu_memory_gb"),
-            max_model_len=body.get("max_model_len"),
-            tensor_parallel_size=body.get("tensor_parallel_size", 1),
+            backends=body.get("backends"),
+            routing_state=body.get("routing_state", ROUTING_FAST_ONLY),
+            mix_weight=body.get("mix_weight", 50),
             worker_id=body.get("worker_id"),
-            fake=body.get("fake"),
-            fake_response=body.get("fake_response"),
-            fake_delay=body.get("fake_delay"),
-            fake_delay_ms=body.get("fake_delay_ms"),
-            fake_capacity=body.get("fake_capacity"),
-            min_replicas=body.get("min_replicas"),
         )
 
     @fastapi_app.delete("/admin/models/{alias}")
@@ -811,6 +925,7 @@ class RouterManagerServe(WorkerRegistryCore):
             "health": await self.health(),
             "models": await self.list_models(),
             "workers": await self.list_workers(),
+            "autoscaler_enabled": self.autoscaler_enabled,
         }
 
     @fastapi_app.get("/workers")

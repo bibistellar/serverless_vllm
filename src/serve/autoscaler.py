@@ -3,13 +3,32 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from collections import Counter
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+BACKEND_VLLM = "vllm"
+BACKEND_LLAMA_CPP = "llama.cpp"
+
+ROUTING_COLD = "COLD"
+ROUTING_FAST_ONLY = "FAST_ONLY"
+ROUTING_WARMING_VLLM = "WARMING_VLLM"
+ROUTING_MIXED = "MIXED"
+ROUTING_VLLM_PRIMARY = "VLLM_PRIMARY"
+ROUTING_DEGRADED_FAST = "DEGRADED_FAST"
+_ROUTING_STATES = {
+    ROUTING_COLD,
+    ROUTING_FAST_ONLY,
+    ROUTING_WARMING_VLLM,
+    ROUTING_MIXED,
+    ROUTING_VLLM_PRIMARY,
+    ROUTING_DEGRADED_FAST,
+}
 
 
 def _print(msg: str) -> None:
@@ -56,11 +75,392 @@ class LoadBasedAutoscaler:
         self._last_scale_down: Dict[str, float] = {}
         self._scale_up_thresholds: Dict[str, float] = {}
         self._baseline_pending: set[str] = set()
+        self.hybrid_prepare_conc = max(1, int(float(os.getenv("HYBRID_PREPARE_CONC", "3"))))
+        self.hybrid_up_consecutive = max(1, int(float(os.getenv("HYBRID_UP_CONSECUTIVE", "2"))))
+        self.hybrid_down_hold_s = float(os.getenv("HYBRID_DOWN_HOLD_S", "180"))
+        self.hybrid_degraded_retry_s = float(os.getenv("HYBRID_DEGRADED_RETRY_S", "60"))
+        self.hybrid_mix_step_interval_s = float(os.getenv("HYBRID_MIX_STEP_INTERVAL_S", "20"))
+        mix_weights_raw = os.getenv("HYBRID_MIX_WEIGHTS", "20,50,80,100")
+        self.hybrid_mix_weights = self._parse_mix_weights(mix_weights_raw)
+        self._high_load_streak: Dict[str, int] = {}
+        self._low_load_since: Dict[str, float] = {}
+        self._degraded_since: Dict[str, float] = {}
+        self._last_mix_step_ts: Dict[str, float] = {}
         self._task: Optional[asyncio.Task] = None
 
     def start(self, registry) -> None:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._loop(registry))
+
+    @staticmethod
+    def _parse_mix_weights(value: str) -> List[int]:
+        weights: List[int] = []
+        for part in str(value).split(","):
+            token = part.strip()
+            if not token:
+                continue
+            try:
+                parsed = int(token)
+            except ValueError:
+                continue
+            parsed = max(0, min(100, parsed))
+            if parsed not in weights:
+                weights.append(parsed)
+        if not weights:
+            return [20, 50, 80, 100]
+        weights = sorted(weights)
+        if weights[-1] != 100:
+            weights.append(100)
+        return weights
+
+    @staticmethod
+    def _normalize_routing_state(routing_state: str) -> str:
+        state = (routing_state or ROUTING_FAST_ONLY).upper()
+        if state not in _ROUTING_STATES:
+            return ROUTING_FAST_ONLY
+        return state
+
+    @staticmethod
+    def _primary_backend_for_state(routing_state: str) -> str:
+        state = LoadBasedAutoscaler._normalize_routing_state(routing_state)
+        if state in {ROUTING_VLLM_PRIMARY, ROUTING_MIXED}:
+            return BACKEND_VLLM
+        return BACKEND_LLAMA_CPP
+
+    @staticmethod
+    def _scale_backend_for_state(routing_state: str) -> str:
+        state = LoadBasedAutoscaler._normalize_routing_state(routing_state)
+        if state in {ROUTING_WARMING_VLLM, ROUTING_MIXED, ROUTING_VLLM_PRIMARY}:
+            return BACKEND_VLLM
+        return BACKEND_LLAMA_CPP
+
+    def _resolve_min_replicas(self, config: Dict) -> int:
+        backends = config.get("backends")
+        if isinstance(backends, dict) and backends:
+            primary = self._primary_backend_for_state(config.get("routing_state", ROUTING_FAST_ONLY))
+            primary_cfg = backends.get(primary)
+            if not isinstance(primary_cfg, dict):
+                primary_cfg = next(
+                    (cfg for cfg in backends.values() if isinstance(cfg, dict)),
+                    {},
+                )
+            value = primary_cfg.get("min_replicas", self.min_replicas)
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                return self.min_replicas
+        return self.min_replicas
+
+    @staticmethod
+    def _has_backend(config: Dict[str, Any], backend_type: str) -> bool:
+        backends = config.get("backends")
+        return isinstance(backends, dict) and backend_type in backends
+
+    @staticmethod
+    def _inflight_sum(instances: List[Dict[str, Any]], backend_type: Optional[str] = None) -> int:
+        selected = instances
+        if backend_type is not None:
+            selected = [i for i in instances if i.get("backend_type") == backend_type]
+        return sum(int(i.get("inflight_requests", 0)) for i in selected)
+
+    def _load_ratio(self, instances: List[Dict[str, Any]]) -> float:
+        inflight = self._inflight_sum(instances)
+        cap_sum, _, _ = self._capacity_stats(instances)
+        if cap_sum <= 0:
+            return 0.0
+        return inflight / cap_sum
+
+    def _next_mix_weight(self, current: int) -> int:
+        current = max(0, min(100, int(current)))
+        for weight in self.hybrid_mix_weights:
+            if weight > current:
+                return weight
+        return 100
+
+    async def _set_routing_state(
+        self,
+        registry,
+        model_alias: str,
+        *,
+        new_state: str,
+        reason: str,
+        now: float,
+        mix_weight: Optional[int] = None,
+    ) -> None:
+        normalized_state = self._normalize_routing_state(new_state)
+        async with registry._lock:
+            config = registry.model_configs.get(model_alias)
+            if not isinstance(config, dict):
+                return
+            old_state = self._normalize_routing_state(config.get("routing_state", ROUTING_FAST_ONLY))
+            config["routing_state"] = normalized_state
+            if mix_weight is not None:
+                config["mix_weight"] = max(0, min(100, int(mix_weight)))
+            config["switch_reason"] = reason
+            config["last_switch_ts"] = now
+
+        if old_state != normalized_state:
+            if normalized_state == ROUTING_DEGRADED_FAST:
+                self._degraded_since[model_alias] = now
+            else:
+                self._degraded_since.pop(model_alias, None)
+            _print(
+                f"autoscaler: model={model_alias} routing {old_state} -> {normalized_state} "
+                f"reason={reason}"
+            )
+
+    def _apply_routing_activity(self, registry, state: str, instances: List[Dict[str, Any]]) -> None:
+        ready_fast = [
+            i for i in instances
+            if i.get("backend_type") == BACKEND_LLAMA_CPP and registry._is_instance_ready(i)
+        ]
+        ready_slow = [
+            i for i in instances
+            if i.get("backend_type") == BACKEND_VLLM and registry._is_instance_ready(i)
+        ]
+
+        for inst in instances:
+            inst["active"] = False
+            if registry._is_instance_ready(inst):
+                inst["pending_active"] = False
+
+        if state in {ROUTING_FAST_ONLY, ROUTING_WARMING_VLLM, ROUTING_DEGRADED_FAST}:
+            selected = ready_fast or ready_slow
+            for inst in selected:
+                inst["active"] = True
+            return
+
+        if state == ROUTING_MIXED:
+            for inst in ready_fast + ready_slow:
+                inst["active"] = True
+            return
+
+        if state == ROUTING_VLLM_PRIMARY:
+            selected = ready_slow or ready_fast
+            for inst in selected:
+                inst["active"] = True
+            return
+
+    async def _decide_routing_state(
+        self,
+        registry,
+        model_alias: str,
+        config: Dict[str, Any],
+        instances: List[Dict[str, Any]],
+        now: float,
+    ) -> tuple[str, int]:
+        state = self._normalize_routing_state(config.get("routing_state", ROUTING_FAST_ONLY))
+        mix_weight = max(0, min(100, int(config.get("mix_weight", 50) or 50)))
+        has_fast = self._has_backend(config, BACKEND_LLAMA_CPP)
+        has_slow = self._has_backend(config, BACKEND_VLLM)
+
+        ready_fast = [
+            i for i in instances
+            if i.get("backend_type") == BACKEND_LLAMA_CPP and registry._is_instance_ready(i)
+        ]
+        ready_slow = [
+            i for i in instances
+            if i.get("backend_type") == BACKEND_VLLM and registry._is_instance_ready(i)
+        ]
+        pending_slow = [
+            i for i in instances
+            if i.get("backend_type") == BACKEND_VLLM
+            and (
+                i.get("pending_active")
+                or str(i.get("status", "")).lower() == "starting"
+            )
+        ]
+
+        total_load = self._load_ratio(instances)
+        total_inflight = self._inflight_sum(instances)
+        high_load = (
+            total_inflight >= self.hybrid_prepare_conc
+            or total_load >= float(registry.scale_up_load_threshold)
+        )
+        if high_load:
+            self._high_load_streak[model_alias] = self._high_load_streak.get(model_alias, 0) + 1
+        else:
+            self._high_load_streak[model_alias] = 0
+
+        if state == ROUTING_VLLM_PRIMARY:
+            if total_load < float(registry.scale_down_load_threshold) and self._inflight_sum(instances, BACKEND_VLLM) == 0:
+                self._low_load_since.setdefault(model_alias, now)
+            else:
+                self._low_load_since.pop(model_alias, None)
+        else:
+            self._low_load_since.pop(model_alias, None)
+
+        if not has_fast and has_slow and state in {
+            ROUTING_FAST_ONLY,
+            ROUTING_WARMING_VLLM,
+            ROUTING_DEGRADED_FAST,
+            ROUTING_COLD,
+        }:
+            await self._set_routing_state(
+                registry,
+                model_alias,
+                new_state=ROUTING_VLLM_PRIMARY,
+                reason="only_slow_backend_available",
+                now=now,
+                mix_weight=100,
+            )
+            return ROUTING_VLLM_PRIMARY, 100
+
+        if has_fast and not has_slow and state in {
+            ROUTING_WARMING_VLLM,
+            ROUTING_MIXED,
+            ROUTING_VLLM_PRIMARY,
+        }:
+            await self._set_routing_state(
+                registry,
+                model_alias,
+                new_state=ROUTING_FAST_ONLY,
+                reason="only_fast_backend_available",
+                now=now,
+            )
+            return ROUTING_FAST_ONLY, 50
+
+        if state == ROUTING_COLD:
+            if ready_fast:
+                await self._set_routing_state(
+                    registry,
+                    model_alias,
+                    new_state=ROUTING_FAST_ONLY,
+                    reason="fast_ready",
+                    now=now,
+                )
+                return ROUTING_FAST_ONLY, 50
+            if ready_slow:
+                await self._set_routing_state(
+                    registry,
+                    model_alias,
+                    new_state=ROUTING_VLLM_PRIMARY,
+                    reason="slow_ready",
+                    now=now,
+                    mix_weight=100,
+                )
+                return ROUTING_VLLM_PRIMARY, 100
+            return state, mix_weight
+
+        if state in {ROUTING_FAST_ONLY, ROUTING_DEGRADED_FAST}:
+            if has_slow:
+                if state == ROUTING_DEGRADED_FAST:
+                    degraded_since = self._degraded_since.get(model_alias, now)
+                    if now - degraded_since >= self.hybrid_degraded_retry_s:
+                        await self._set_routing_state(
+                            registry,
+                            model_alias,
+                            new_state=ROUTING_WARMING_VLLM,
+                            reason="degraded_retry_window",
+                            now=now,
+                        )
+                        return ROUTING_WARMING_VLLM, mix_weight
+                elif self._high_load_streak.get(model_alias, 0) >= self.hybrid_up_consecutive:
+                    await self._set_routing_state(
+                        registry,
+                        model_alias,
+                        new_state=ROUTING_WARMING_VLLM,
+                        reason="high_load_prepare_slow",
+                        now=now,
+                    )
+                    return ROUTING_WARMING_VLLM, mix_weight
+            return state, mix_weight
+
+        if state == ROUTING_WARMING_VLLM:
+            if ready_slow:
+                first_weight = self.hybrid_mix_weights[0]
+                self._last_mix_step_ts[model_alias] = now
+                await self._set_routing_state(
+                    registry,
+                    model_alias,
+                    new_state=ROUTING_MIXED,
+                    reason="slow_ready_for_mixed",
+                    now=now,
+                    mix_weight=first_weight,
+                )
+                return ROUTING_MIXED, first_weight
+            if not has_slow:
+                await self._set_routing_state(
+                    registry,
+                    model_alias,
+                    new_state=ROUTING_FAST_ONLY,
+                    reason="slow_backend_missing",
+                    now=now,
+                )
+                return ROUTING_FAST_ONLY, mix_weight
+            if not pending_slow and self._high_load_streak.get(model_alias, 0) == 0:
+                await self._set_routing_state(
+                    registry,
+                    model_alias,
+                    new_state=ROUTING_FAST_ONLY,
+                    reason="load_recovered_before_slow_ready",
+                    now=now,
+                )
+                return ROUTING_FAST_ONLY, mix_weight
+            return state, mix_weight
+
+        if state == ROUTING_MIXED:
+            if has_slow and not ready_slow:
+                self._degraded_since[model_alias] = now
+                await self._set_routing_state(
+                    registry,
+                    model_alias,
+                    new_state=ROUTING_DEGRADED_FAST,
+                    reason="slow_not_ready_in_mixed",
+                    now=now,
+                )
+                return ROUTING_DEGRADED_FAST, mix_weight
+
+            last_step_ts = self._last_mix_step_ts.get(model_alias, 0.0)
+            if now - last_step_ts >= self.hybrid_mix_step_interval_s:
+                next_weight = self._next_mix_weight(mix_weight)
+                self._last_mix_step_ts[model_alias] = now
+                if next_weight >= 100:
+                    await self._set_routing_state(
+                        registry,
+                        model_alias,
+                        new_state=ROUTING_VLLM_PRIMARY,
+                        reason="mixed_promoted_to_vllm_primary",
+                        now=now,
+                        mix_weight=100,
+                    )
+                    return ROUTING_VLLM_PRIMARY, 100
+                await self._set_routing_state(
+                    registry,
+                    model_alias,
+                    new_state=ROUTING_MIXED,
+                    reason="mixed_weight_step",
+                    now=now,
+                    mix_weight=next_weight,
+                )
+                return ROUTING_MIXED, next_weight
+            return state, mix_weight
+
+        if state == ROUTING_VLLM_PRIMARY:
+            if has_slow and not ready_slow:
+                self._degraded_since[model_alias] = now
+                await self._set_routing_state(
+                    registry,
+                    model_alias,
+                    new_state=ROUTING_DEGRADED_FAST,
+                    reason="slow_not_ready_in_vllm_primary",
+                    now=now,
+                )
+                return ROUTING_DEGRADED_FAST, mix_weight
+
+            low_since = self._low_load_since.get(model_alias)
+            if has_fast and low_since is not None and now - low_since >= self.hybrid_down_hold_s:
+                await self._set_routing_state(
+                    registry,
+                    model_alias,
+                    new_state=ROUTING_FAST_ONLY,
+                    reason="low_load_back_to_fast",
+                    now=now,
+                )
+                return ROUTING_FAST_ONLY, 50
+            return state, mix_weight
+
+        return state, mix_weight
 
     def _capacity_stats(self, instances: List[Dict]) -> tuple[int, float, int]:
         caps: List[int] = []
@@ -225,22 +625,28 @@ class LoadBasedAutoscaler:
             if not instances:
                 continue
 
+            now = time.time()
+            routing_state, mix_weight = await self._decide_routing_state(
+                registry, model_alias, config, instances, now
+            )
+            config["routing_state"] = routing_state
+            config["mix_weight"] = mix_weight
+            self._apply_routing_activity(registry, routing_state, instances)
+
             active = [i for i in instances if i.get("active")]
-            ready_not_active = [i for i in instances if (not i.get("active")) and registry._is_instance_ready(i)]
             pending = [
                 i for i in instances
                 if (i.get("pending_active") or str(i.get("status", "")).lower() == "starting")
                 and str(i.get("status", "")).lower() not in {"error", "stopped"}
             ]
-            min_replicas = config.get("min_replicas", self.min_replicas)
-            try:
-                min_replicas = max(0, int(min_replicas))
-            except (TypeError, ValueError):
-                min_replicas = self.min_replicas
-            if len(active) < min_replicas and ready_not_active:
-                for inst in ready_not_active[: min_replicas - len(active)]:
-                    inst["active"] = True
-            active = [i for i in instances if i.get("active")]
+            min_replicas = self._resolve_min_replicas(config)
+            target_backend = self._scale_backend_for_state(routing_state)
+            if not self._has_backend(config, target_backend):
+                target_backend = (
+                    BACKEND_LLAMA_CPP
+                    if self._has_backend(config, BACKEND_LLAMA_CPP)
+                    else BACKEND_VLLM
+                )
             if len(active) < min_replicas:
                 detail = self._format_stats(
                     instances,
@@ -264,10 +670,17 @@ class LoadBasedAutoscaler:
                     f"autoscaler: model={model_alias} active={len(active)} "
                     f"pending={len(pending)} min_replicas={min_replicas} {detail} -> scale up"
                 )
-                await self._scale_up(registry, model_alias, instances, config, time.time())
+                await self._scale_up(
+                    registry,
+                    model_alias,
+                    instances,
+                    config,
+                    now,
+                    target_backend=target_backend,
+                    routing_state=routing_state,
+                )
                 continue
 
-            now = time.time()
             scale_up_threshold = self._scale_up_thresholds.get(
                 model_alias, self.scale_up_latency_threshold
             )
@@ -302,7 +715,15 @@ class LoadBasedAutoscaler:
                     f"autoscaler: model={model_alias} active=0 pending=0 "
                     f"avg_latency={avg_latency:.3f}s samples={sample_count} {detail} -> scale up"
                 )
-                await self._scale_up(registry, model_alias, instances, config, now)
+                await self._scale_up(
+                    registry,
+                    model_alias,
+                    instances,
+                    config,
+                    now,
+                    target_backend=target_backend,
+                    routing_state=routing_state,
+                )
                 continue
 
             if load_active > scale_up_load_threshold:
@@ -320,7 +741,15 @@ class LoadBasedAutoscaler:
                     f"samples={sample_count} {detail} "
                     f"load_active>{scale_up_load_threshold:.2f} -> scale up"
                 )
-                await self._scale_up(registry, model_alias, instances, config, now)
+                await self._scale_up(
+                    registry,
+                    model_alias,
+                    instances,
+                    config,
+                    now,
+                    target_backend=target_backend,
+                    routing_state=routing_state,
+                )
             elif load_active < scale_down_load_threshold:
                 _print(
                     f"autoscaler: model={model_alias} active={len(active)} "
@@ -328,7 +757,15 @@ class LoadBasedAutoscaler:
                     f"samples={sample_count} {detail} "
                     f"load_active<{scale_down_load_threshold:.2f} -> scale down"
                 )
-                await self._scale_down(registry, model_alias, instances, config, now, min_replicas)
+                await self._scale_down(
+                    registry,
+                    model_alias,
+                    instances,
+                    config,
+                    now,
+                    min_replicas,
+                    routing_state=routing_state,
+                )
 
     def _avg_latency(self, active: List[Dict], now: float) -> tuple[float, int]:
         latencies = []
@@ -406,6 +843,9 @@ class LoadBasedAutoscaler:
         instances: List[Dict],
         config: Dict,
         now: float,
+        *,
+        target_backend: str,
+        routing_state: str,
     ) -> None:
         last = self._last_scale_up.get(model_alias, 0.0)
         if now - last < self.scale_up_cooldown_s:
@@ -417,7 +857,9 @@ class LoadBasedAutoscaler:
 
         sleeping = [
             i for i in instances
-            if registry._sleep_level_value(i) > 0 and not i.get("pending_active")
+            if i.get("backend_type") == target_backend
+            and registry._sleep_level_value(i) > 0
+            and not i.get("pending_active")
         ]
         if sleeping:
             candidate = min(sleeping, key=lambda i: registry._sleep_level_value(i))
@@ -426,21 +868,38 @@ class LoadBasedAutoscaler:
             self._last_scale_up[model_alias] = now
             _print(
                 f"autoscaler: model={model_alias} wake instance={candidate.get('instance_alias')} "
-                f"level={registry._sleep_level_value(candidate)}"
+                f"level={registry._sleep_level_value(candidate)} state={routing_state}"
             )
             return
 
+        backend_cfg = (config.get("backends") or {}).get(target_backend) or {}
+        backend_max_replicas = backend_cfg.get("max_replicas", self.max_replicas)
+        try:
+            backend_max_replicas = max(0, int(backend_max_replicas))
+        except (TypeError, ValueError):
+            backend_max_replicas = self.max_replicas
         effective_instances = [
             i for i in instances
-            if str(i.get("status", "")).lower() not in {"error", "stopped"}
+            if i.get("backend_type") == target_backend
+            and str(i.get("status", "")).lower() not in {"error", "stopped"}
         ]
-        if len(effective_instances) >= self.max_replicas:
-            _print(f"autoscaler: model={model_alias} reached max_replicas={self.max_replicas}")
+        if len(effective_instances) >= backend_max_replicas:
+            _print(
+                f"autoscaler: model={model_alias} backend={target_backend} "
+                f"reached max_replicas={backend_max_replicas}"
+            )
             return
 
-        await registry._start_new_instance(model_alias, config)
+        await registry._start_new_instance(
+            model_alias,
+            config,
+            backend_type=target_backend,
+        )
         self._last_scale_up[model_alias] = now
-        _print(f"autoscaler: model={model_alias} start new instance")
+        _print(
+            f"autoscaler: model={model_alias} start new instance backend={target_backend} "
+            f"state={routing_state}"
+        )
 
     async def _scale_down(
         self,
@@ -450,6 +909,8 @@ class LoadBasedAutoscaler:
         config: Dict,
         now: float,
         min_replicas: int,
+        *,
+        routing_state: str,
     ) -> None:
         last = self._last_scale_down.get(model_alias, 0.0)
         if now - last < self.scale_down_cooldown_s:
@@ -469,10 +930,24 @@ class LoadBasedAutoscaler:
             _print(f"autoscaler: model={model_alias} no idle active instances")
             return
 
-        candidate = sorted(idle, key=lambda i: i.get("created_at", 0))[-1]
+        state = self._normalize_routing_state(routing_state)
+        if state in {ROUTING_VLLM_PRIMARY, ROUTING_MIXED}:
+            preferred_backend_order = [BACKEND_LLAMA_CPP, BACKEND_VLLM]
+        else:
+            preferred_backend_order = [BACKEND_VLLM, BACKEND_LLAMA_CPP]
+
+        candidate = None
+        for backend_type in preferred_backend_order:
+            pool = [i for i in idle if i.get("backend_type") == backend_type]
+            if pool:
+                candidate = sorted(pool, key=lambda i: i.get("created_at", 0))[-1]
+                break
+        if candidate is None:
+            candidate = sorted(idle, key=lambda i: i.get("created_at", 0))[-1]
         candidate["active"] = False
         candidate["pending_active"] = False
         self._last_scale_down[model_alias] = now
         _print(
-            f"autoscaler: model={model_alias} remove active instance={candidate.get('instance_alias')}"
+            f"autoscaler: model={model_alias} remove active instance={candidate.get('instance_alias')} "
+            f"backend={candidate.get('backend_type')} state={state}"
         )

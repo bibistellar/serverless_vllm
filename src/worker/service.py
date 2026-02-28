@@ -15,18 +15,20 @@ import time
 import signal
 import atexit
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 import uvicorn
 
-from src.common.models import InstanceStatus
-from src.common.utils import get_gpu_info
-from src.worker.vllm_instance import VLLMManager,SleepLevel
-from src.worker.openai_protocol import (
+from ..common.models import InstanceStatus
+from ..common.utils import get_gpu_info
+from .vllm_instance import VLLMManager, SleepLevel
+from .llama_instance import LlamaManager
+from .openai_protocol import (
     ChatCompletionRequest,
     convert_to_sampling_params,
+    compute_text_delta,
     format_chat_completion_response,
     stream_chat_completion
 )
@@ -36,6 +38,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+BACKEND_VLLM = "vllm"
+BACKEND_LLAMA_CPP = "llama.cpp"
+SUPPORTED_BACKENDS = {BACKEND_VLLM, BACKEND_LLAMA_CPP}
 
 
 class WorkerService:
@@ -57,6 +63,8 @@ class WorkerService:
         
         # vLLM 实例管理器
         self.vllm_manager = VLLMManager()
+        # llama.cpp 实例管理器
+        self.llama_manager = LlamaManager()
         
         # GPU 信息
         self.gpu_info = get_gpu_info()
@@ -66,6 +74,40 @@ class WorkerService:
         self._setup_routes()
         
         # 已废弃心跳机制（保留注册/注销）
+
+    def _validate_backend_type(self, backend_type: str) -> str:
+        if backend_type not in SUPPORTED_BACKENDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"backend_type must be one of {sorted(SUPPORTED_BACKENDS)}",
+            )
+        return backend_type
+
+    def _get_manager_by_backend(self, backend_type: str):
+        if backend_type == BACKEND_VLLM:
+            return self.vllm_manager
+        if backend_type == BACKEND_LLAMA_CPP:
+            return self.llama_manager
+        raise HTTPException(status_code=400, detail=f"unsupported backend_type: {backend_type}")
+
+    def _resolve_alias(self, alias: str) -> Optional[Tuple[str, object]]:
+        if self.vllm_manager.get_instance(alias):
+            return BACKEND_VLLM, self.vllm_manager
+        if self.llama_manager.get_instance(alias):
+            return BACKEND_LLAMA_CPP, self.llama_manager
+        return None
+
+    def _list_all_instances(self) -> Dict[str, Dict]:
+        out: Dict[str, Dict] = {}
+        for alias, instance in self.vllm_manager.list_instances().items():
+            payload = instance.to_dict()
+            payload["backend_type"] = BACKEND_VLLM
+            out[alias] = payload
+        for alias, instance in self.llama_manager.list_instances().items():
+            payload = instance.to_dict()
+            payload["backend_type"] = BACKEND_LLAMA_CPP
+            out[alias] = payload
+        return out
     
     def _setup_routes(self):
         """设置 API 路由"""
@@ -77,7 +119,7 @@ class WorkerService:
                 "status": "ok",
                 "worker_id": self.worker_id,
                 "gpu_info": self.gpu_info.to_dict(),
-                "instances": len(self.vllm_manager.instances)
+                "instances": len(self.vllm_manager.instances) + len(self.llama_manager.instances)
             }
         
         @self.app.get("/info")
@@ -86,15 +128,12 @@ class WorkerService:
             return {
                 "worker_id": self.worker_id,
                 "gpu_info": self.gpu_info.to_dict(),
-                "instances": {
-                    alias: instance.to_dict()
-                    for alias, instance in self.vllm_manager.list_instances().items()
-                }
+                "instances": self._list_all_instances(),
             }
         
         @self.app.post("/instances/start")
         async def start_instance(request: Request):
-            """启动 vLLM 实例
+            """启动实例
             
             请求体：
             {
@@ -110,44 +149,73 @@ class WorkerService:
                 body = await request.json()
                 alias = body.get("alias")
                 model_name = body.get("model_name")
+                backend_type_raw = body.get("backend_type")
                 
-                if not alias or not model_name:
+                if not alias or not model_name or not isinstance(backend_type_raw, str):
                     raise HTTPException(
                         status_code=400,
-                        detail="alias and model_name are required"
+                        detail="alias, model_name and backend_type are required"
                     )
-                
+                backend_type = self._validate_backend_type(backend_type_raw)
+                if self._resolve_alias(alias):
+                    raise HTTPException(status_code=409, detail=f"Instance {alias} already exists")
+
                 is_fake = model_name in {"__fake__", "fake", "mock", "dummy"} or str(model_name).startswith("fake:")
                 if body.get("fake", False):
                     is_fake = True
 
-                instance = await self.vllm_manager.start_instance(
-                    alias=alias,
-                    model_name=model_name,
-                    model_path=body.get("model_path"),
-                    gpu_memory_utilization=body.get("gpu_memory_utilization", 0.9),
-                    max_model_len=body.get("max_model_len"),
-                    tensor_parallel_size=body.get("tensor_parallel_size", 1),
-                    fake=is_fake,
-                    fake_response=body.get("fake_response"),
-                    fake_delay=body.get("fake_delay"),
-                    fake_delay_ms=body.get("fake_delay_ms"),
-                    fake_capacity=body.get("fake_capacity"),
-                )
+                manager = self._get_manager_by_backend(backend_type)
+                if backend_type == BACKEND_VLLM:
+                    instance = await manager.start_instance(
+                        alias=alias,
+                        model_name=model_name,
+                        model_path=body.get("model_path"),
+                        gpu_memory_utilization=body.get("gpu_memory_utilization", 0.9),
+                        max_model_len=body.get("max_model_len"),
+                        tensor_parallel_size=body.get("tensor_parallel_size", 1),
+                        fake=is_fake,
+                        fake_response=body.get("fake_response"),
+                        fake_delay=body.get("fake_delay"),
+                        fake_delay_ms=body.get("fake_delay_ms"),
+                        fake_capacity=body.get("fake_capacity"),
+                    )
+                else:
+                    instance = await manager.start_instance(
+                        alias=alias,
+                        model_name=model_name,
+                        model_path=body.get("model_path"),
+                        fake=is_fake,
+                        fake_response=body.get("fake_response"),
+                        fake_delay=body.get("fake_delay"),
+                        fake_delay_ms=body.get("fake_delay_ms"),
+                        fake_capacity=body.get("fake_capacity"),
+                        llama_filename=body.get("llama_filename"),
+                        llama_mmproj_path=body.get("llama_mmproj_path"),
+                        llama_n_gpu_layers=int(body.get("llama_n_gpu_layers", -1)),
+                        max_model_len=body.get("max_model_len"),
+                    )
                 
+                payload = instance.to_dict()
+                payload["backend_type"] = backend_type
                 return {
                     "status": "success",
-                    "instance": instance.to_dict()
+                    "instance": payload,
                 }
                 
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Failed to start instance: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
         
         @self.app.post("/instances/{alias}/stop")
         async def stop_instance(alias: str):
-            """停止 vLLM 实例"""
-            success = await self.vllm_manager.stop_instance(alias)
+            """停止实例"""
+            resolved = self._resolve_alias(alias)
+            if not resolved:
+                raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
+            _, manager = resolved
+            success = await manager.stop_instance(alias)
             if success:
                 return {"status": "success", "message": f"Instance {alias} stopped"}
             else:
@@ -156,19 +224,18 @@ class WorkerService:
         @self.app.get("/instances")
         async def list_instances():
             """列出所有实例"""
-            instances = self.vllm_manager.list_instances()
-            return {
-                "instances": {
-                    alias: instance.to_dict()
-                    for alias, instance in instances.items()
-                }
-            }
+            return {"instances": self._list_all_instances()}
         
         @self.app.get("/instances/{alias}/status")
         async def get_instance_status(alias: str):
             """获取实例详细状态（包括睡眠级别）"""
-            status = self.vllm_manager.get_instance_status(alias)
+            resolved = self._resolve_alias(alias)
+            if not resolved:
+                raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
+            backend_type, manager = resolved
+            status = manager.get_instance_status(alias)
             if status:
+                status["backend_type"] = backend_type
                 status["gpu_info"] = get_gpu_info().to_dict()
                 return status
             else:
@@ -185,6 +252,16 @@ class WorkerService:
             }
             """
             try:
+                resolved = self._resolve_alias(alias)
+                if not resolved:
+                    raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
+                backend_type, _ = resolved
+                if backend_type != BACKEND_VLLM:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"backend {backend_type} does not support sleep",
+                    )
+
                 body = await request.json()
                 
                 # 支持数字或名称
@@ -237,6 +314,16 @@ class WorkerService:
         async def wake_instance(alias: str):
             """唤醒实例到激活状态"""
             try:
+                resolved = self._resolve_alias(alias)
+                if not resolved:
+                    raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
+                backend_type, _ = resolved
+                if backend_type != BACKEND_VLLM:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"backend {backend_type} does not support wake",
+                    )
+
                 success = await self.vllm_manager.set_sleep_level(alias, SleepLevel.ACTIVE)
                 
                 if success:
@@ -249,6 +336,8 @@ class WorkerService:
                         status_code=500,
                         detail=f"Failed to wake up {alias}"
                     )
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Error waking up {alias}: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -256,21 +345,26 @@ class WorkerService:
         @self.app.post("/proxy/{alias}/v1/chat/completions")
         async def chat_completions(alias: str, request: ChatCompletionRequest):
             """OpenAI Chat Completions API - Qwen3-VL 优化版本"""
-            instance = self.vllm_manager.get_instance(alias)
-            if not instance:
+            resolved = self._resolve_alias(alias)
+            if not resolved:
+                raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
+            backend_type, manager = resolved
+            instance = manager.get_instance(alias)
+            if instance is None:
                 raise HTTPException(status_code=404, detail=f"Instance {alias} not found")
 
-            sleep_level = self.vllm_manager.get_sleep_level(alias)
+            status_payload = manager.get_instance_status(alias) or {}
             logger.info(
-                "proxy chat: alias=%s status=%s sleep_level=%s inflight=%s",
+                "proxy chat: alias=%s backend=%s status=%s inflight=%s",
                 alias,
+                backend_type,
                 instance.status.value,
-                sleep_level.name if sleep_level else "unknown",
-                self.vllm_manager._inflight_requests.get(alias, 0),
+                status_payload.get("inflight_requests", 0),
             )
 
-            # 自动唤醒（包括 UNLOADED）
-            await self.vllm_manager.ensure_active(alias)
+            if backend_type == BACKEND_VLLM:
+                # 自动唤醒（包括 UNLOADED）
+                await self.vllm_manager.ensure_active(alias)
             
             # 检查模型状态
             if instance.status == InstanceStatus.STARTING:
@@ -291,16 +385,6 @@ class WorkerService:
                     detail=f"Instance {alias} is not running (status: {instance.status.value})"
                 )
             
-            # 转换 OpenAI 格式的消息为 Qwen3-VL 格式
-            from src.worker.openai_protocol import process_messages_to_qwen_format
-            
-            try:
-                qwen_messages = await process_messages_to_qwen_format(request.messages)
-                logger.debug(f"Converted {len(qwen_messages)} messages for {alias}")
-            except Exception as e:
-                logger.error(f"Failed to convert messages: {e}")
-                raise HTTPException(status_code=400, detail=f"Invalid message format: {e}")
-            
             # 构建采样参数
             sampling_params = convert_to_sampling_params(
                 temperature=request.temperature,
@@ -318,8 +402,8 @@ class WorkerService:
             try:
                 if request.stream:
                     # 流式响应
-                    engine_output = self.vllm_manager.generate(
-                        alias, qwen_messages, sampling_params
+                    engine_output = manager.generate(
+                        alias, request.messages, sampling_params, base_model=request.base_model
                     )
                     return StreamingResponse(
                         stream_chat_completion(engine_output, request_id, request.model),
@@ -328,13 +412,20 @@ class WorkerService:
                 else:
                     # 非流式响应
                     full_text = ""
+                    previous_text = ""
                     finish_reason = "stop"
                     
-                    async for output in self.vllm_manager.generate(
-                        alias, qwen_messages, sampling_params
-                    ):
+                    output_iter = manager.generate(
+                        alias, request.messages, sampling_params, base_model=request.base_model
+                    )
+
+                    async for output in output_iter:
                         for completion_output in output.outputs:
-                            full_text = completion_output.text
+                            delta, previous_text = compute_text_delta(
+                                previous_text, completion_output.text
+                            )
+                            if delta:
+                                full_text += delta
                             if completion_output.finish_reason:
                                 finish_reason = completion_output.finish_reason
                     
@@ -347,6 +438,9 @@ class WorkerService:
                     
                     return JSONResponse(content=response)
             
+            except (ValueError, TypeError, FileNotFoundError) as e:
+                logger.error(f"Invalid request payload for {alias}: {e}")
+                raise HTTPException(status_code=400, detail=f"Invalid message format: {e}")
             except Exception as e:
                 logger.error(f"Error during generation for {alias}: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -410,10 +504,16 @@ class WorkerService:
         # 停止睡眠监控任务
         await self.vllm_manager.stop_sleep_monitor()
         
-        # 停止所有 vLLM 实例
+        # 停止所有实例
         for alias in list(self.vllm_manager.instances.keys()):
             try:
                 await self.vllm_manager.stop_instance(alias)
+                logger.info(f"Stopped instance: {alias}")
+            except Exception as e:
+                logger.error(f"Error stopping instance {alias}: {e}")
+        for alias in list(self.llama_manager.instances.keys()):
+            try:
+                await self.llama_manager.stop_instance(alias)
                 logger.info(f"Stopped instance: {alias}")
             except Exception as e:
                 logger.error(f"Error stopping instance {alias}: {e}")

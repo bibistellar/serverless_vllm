@@ -4,14 +4,12 @@
 简化了多模态处理逻辑，专注于 Qwen3-VL 模型
 """
 import time
-import uuid
-import base64
-import io
 import logging
 from typing import Dict, List, Optional, AsyncIterator, Union
 from pydantic import BaseModel
 from vllm.sampling_params import SamplingParams
-from PIL import Image
+
+from .message_adapters import convert_messages_for_backend as _convert_messages_for_backend
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +24,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
+    base_model: Optional[str] = None
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
@@ -35,17 +34,6 @@ class ChatCompletionRequest(BaseModel):
     # vLLM额外参数
     top_k: Optional[int] = -1
     repetition_penalty: Optional[float] = None
-
-
-class CompletionRequest(BaseModel):
-    """简化版本的 Completion 请求（主要使用 Chat Completion）"""
-    model: str
-    prompt: str
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 1.0
-    max_tokens: Optional[int] = 1024
-    stream: Optional[bool] = False
-    stop: Optional[List[str]] = None
 
 
 def convert_to_sampling_params(
@@ -72,78 +60,17 @@ def convert_to_sampling_params(
     return SamplingParams(**params)
 
 
-async def process_messages_to_qwen_format(messages: List[ChatMessage]) -> List[Dict]:
-    """将 OpenAI 格式的消息转换为 Qwen3-VL 格式
-    
-    处理多模态 content，支持文本和图像（base64 编码）
-    
-    Args:
-        messages: OpenAI 格式的消息列表
-        
-    Returns:
-        Qwen3 格式的消息列表
-    """
-    qwen_messages = []
-    
-    for msg in messages:
-        message_dict = {"role": msg.role}
-        
-        # 处理 content
-        if isinstance(msg.content, str):
-            # 纯文本消息
-            message_dict["content"] = msg.content
-        else:
-            # 多模态消息
-            content_list = []
-            for item in msg.content:
-                if not isinstance(item, dict):
-                    continue
-                
-                item_type = item.get("type")
-                
-                if item_type == "text":
-                    content_list.append({
-                        "type": "text",
-                        "text": item.get("text", "")
-                    })
-                elif item_type == "image_url":
-                    # 处理图像 URL
-                    image_url_data = item.get("image_url", {})
-                    if isinstance(image_url_data, dict):
-                        url = image_url_data.get("url")
-                    else:
-                        url = image_url_data
-                    
-                    if url:
-                        # 支持 base64 编码的图像
-                        if url.startswith("data:image"):
-                            # 提取 base64 数据
-                            header, encoded = url.split(",", 1)
-                            image_bytes = base64.b64decode(encoded)
-                            image = Image.open(io.BytesIO(image_bytes))
-                            
-                            content_list.append({
-                                "type": "image",
-                                "image": image
-                            })
-                        elif url.startswith("http"):
-                            # 支持 URL (Qwen3-VL 会自动下载)
-                            content_list.append({
-                                "type": "image",
-                                "image": url
-                            })
-                        else:
-                            # 本地文件路径
-                            content_list.append({
-                                "type": "image",
-                                "image": url
-                            })
-            
-            message_dict["content"] = content_list
-        
-        qwen_messages.append(message_dict)
-    
-    return qwen_messages
+async def convert_messages_for_backend(
+    messages: List[ChatMessage],
+    backend_type: str,
+    base_model: Optional[str] = None,
+) -> List[Dict]:
+    """统一的消息转换入口，根据 backend/base_model 决定处理策略。"""
+    return _convert_messages_for_backend(
+        messages,
+        backend_type,
+        base_model=base_model,
+    )
 
 
 def format_chat_completion_response(
@@ -203,33 +130,23 @@ def format_chat_completion_chunk(
     return f"data: {json.dumps(chunk)}\n\n"
 
 
-def format_completion_response(
-    request_id: str,
-    model: str,
-    text: str,
-    finish_reason: str = "stop",
-    usage: Optional[Dict] = None
-) -> Dict:
-    """格式化为 OpenAI completion 响应（简化版本）"""
-    return {
-        "id": f"cmpl-{request_id}",
-        "object": "text_completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [
-            {
-                "text": text,
-                "index": 0,
-                "logprobs": None,
-                "finish_reason": finish_reason
-            }
-        ],
-        "usage": usage or {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
-        }
-    }
+def compute_text_delta(previous_text: str, current_text: Optional[str]) -> tuple[str, str]:
+    """Compute incremental delta and updated cumulative text.
+
+    Supports two producer styles:
+    1) cumulative text (current_text = full text so far)
+    2) delta text (current_text = newly generated tokens)
+    """
+    if not current_text:
+        return "", previous_text
+
+    if previous_text and current_text.startswith(previous_text):
+        # Cumulative output.
+        delta = current_text[len(previous_text):]
+        return delta, current_text
+
+    # Assume delta output.
+    return current_text, previous_text + current_text
 
 
 async def stream_chat_completion(
@@ -246,11 +163,9 @@ async def stream_chat_completion(
             finish_reason = completion_output.finish_reason
             
             # 只输出增量文本
-            delta = current_text[len(previous_text):]
+            delta, previous_text = compute_text_delta(previous_text, current_text)
             if delta:
                 yield format_chat_completion_chunk(request_id, model, delta)
-            
-            previous_text = current_text
             
             if finish_reason:
                 yield format_chat_completion_chunk(request_id, model, "", finish_reason)

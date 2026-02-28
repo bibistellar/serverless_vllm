@@ -16,16 +16,21 @@ import logging
 import time
 import os
 import math
+import multiprocessing as mp
 import torch
 from enum import Enum
-from typing import Dict, Optional, AsyncIterator
+from typing import Any, Dict, Optional, AsyncIterator
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
 from vllm.inputs.data import TextPrompt
 from transformers import AutoProcessor
-from qwen_vl_utils import process_vision_info
-from src.common.models import VLLMInstanceInfo, InstanceStatus
+from ..common.models import VLLMInstanceInfo, InstanceStatus
+from .message_adapters import (
+    BACKEND_VLLM,
+    build_vllm_generation_inputs,
+    convert_messages_for_backend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +56,16 @@ def _silence_vllm_logs() -> None:
 
 
 _silence_vllm_logs()
+
+
+def _configure_vllm_spawn() -> None:
+    """Force vLLM workers to use spawn to avoid CUDA re-init failures."""
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        # Start method may already be set by runtime/framework.
+        pass
 
 
 class FakeInstance:
@@ -193,9 +208,7 @@ class VLLMManager:
                 logger.info("Sleep monitor cancelled")
                 break
             except Exception as e:
-                logger.error(f"Error in sleep monitor: {e}")
-                import traceback
-                traceback.print_exc()
+                logger.exception("Error in sleep monitor: %s", e)
     
     async def start_instance(
         self,
@@ -372,6 +385,8 @@ class VLLMManager:
             self._start_tasks.pop(alias, None)
 
     async def _start_real_instance_impl(self, alias: str, config: Dict) -> None:
+        _configure_vllm_spawn()
+
         model_name = config.get("model_name")
         model_path = config.get("model_path")
         gpu_memory_utilization = config.get("gpu_memory_utilization", 0.75)
@@ -549,7 +564,7 @@ class VLLMManager:
                         await self._sleep_level_2(alias)
                     elif current_level == SleepLevel.UNLOADED:
                         # 从卸载状态不能直接到 sleep 2
-                        logger.warning(f"Cannot go from UNLOADED to SLEEP_2 directly")
+                        logger.warning("Cannot go from UNLOADED to SLEEP_2 directly")
                         return False
                 elif level == SleepLevel.UNLOADED:
                     # 完全卸载
@@ -562,9 +577,7 @@ class VLLMManager:
             return True
             
         except Exception as e:
-            logger.error(f"Failed to set sleep level for {alias}: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("Failed to set sleep level for %s: %s", alias, e)
             return False
     
     async def _sleep_level_1(self, alias: str):
@@ -680,12 +693,16 @@ class VLLMManager:
             ok = await self.set_sleep_level(alias, SleepLevel.ACTIVE)
             if not ok:
                 raise RuntimeError(f"Failed to wake up engine {alias} from {current_level.name}")
+
+    def _select_base_model(self, base_model: Optional[str], instance: VLLMInstanceInfo) -> str:
+        return base_model or instance.model_name
     
     async def generate(
         self,
         alias: str,
-        messages: list,
-        sampling_params: SamplingParams
+        messages: Any,
+        sampling_params: SamplingParams,
+        base_model: Optional[str] = None,
     ) -> AsyncIterator:
         """使用指定引擎进行生成（异步生成器，针对 Qwen3-VL 优化）
         
@@ -699,6 +716,16 @@ class VLLMManager:
         """
         if alias not in self.engines and alias not in self.instances:
             raise ValueError(f"Engine {alias} not found")
+        instance = self.instances.get(alias)
+        if instance is None:
+            raise ValueError(f"Instance {alias} not found")
+
+        resolved_base_model = self._select_base_model(base_model, instance)
+        backend_messages = convert_messages_for_backend(
+            messages,
+            BACKEND_VLLM,
+            base_model=resolved_base_model,
+        )
 
         if alias in self.fake_instances:
             # Fake model generation
@@ -764,44 +791,16 @@ class VLLMManager:
         # 更新最后使用时间
         self.update_last_used(alias)
         
-        # 使用 processor 和 qwen_vl_utils 处理消息
-        text = processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        
-        # 使用 qwen_vl_utils 处理多模态信息
-        image_inputs, video_inputs, video_kwargs = process_vision_info(
-            messages,
-            image_patch_size=processor.image_processor.patch_size,
-            return_video_kwargs=True,
-            return_video_metadata=True
-        )
-        
-        # 构建多模态数据
-        mm_data = {}
-        if image_inputs is not None:
-            mm_data['image'] = image_inputs
-            logger.info(f"Processing {len(image_inputs)} image(s)")
-        if video_inputs is not None:
-            mm_data['video'] = video_inputs
-            logger.info(f"Processing video input")
-        
         # 生成唯一的请求 ID
         request_id = f"{alias}-{time.time()}"
-        
-        # 构建输入：使用 TextPrompt 数据结构
-        if mm_data:
-            # 多模态输入
-            inputs = TextPrompt(
-                prompt=text,
-                multi_modal_data=mm_data,
-                mm_processor_kwargs=video_kwargs
-            )
-        else:
-            # 纯文本输入
-            inputs = text
+
+        # 模型专用输入构建逻辑（prompt/mm_data/mm_kwargs）
+        inputs = build_vllm_generation_inputs(
+            backend_messages,
+            processor=processor,
+            text_prompt_cls=TextPrompt,
+            base_model=resolved_base_model,
+        )
         
         # 调用引擎生成（AsyncLLMEngine.generate 返回异步生成器）
         try:

@@ -9,6 +9,9 @@ from typing import Any, Dict, Optional, List
 
 import httpx
 
+BACKEND_VLLM = "vllm"
+BACKEND_LLAMA_CPP = "llama.cpp"
+
 
 class SystemTester:
     def __init__(
@@ -16,16 +19,18 @@ class SystemTester:
         serve_url: str,
         worker_url: str,
         model_alias: str,
-        model_name: str,
-        gpu_memory_gb: float,
-        max_model_len: int,
+        backends: Dict[str, Dict[str, Any]],
+        routing_state: str,
+        mix_weight: int = 50,
+        worker_id: Optional[str] = None,
     ) -> None:
         self.serve_url = serve_url.rstrip("/")
         self.worker_url = worker_url.rstrip("/")
         self.model_alias = model_alias
-        self.model_name = model_name
-        self.gpu_memory_gb = gpu_memory_gb
-        self.max_model_len = max_model_len
+        self.backends = backends
+        self.routing_state = routing_state
+        self.mix_weight = mix_weight
+        self.worker_id = worker_id
 
     async def test_health(self) -> None:
         print("\n=== 健康检查 ===")
@@ -38,10 +43,12 @@ class SystemTester:
         print("\n=== 模型注册 ===")
         payload = {
             "alias": self.model_alias,
-            "model_name": self.model_name,
-            "gpu_memory_gb": self.gpu_memory_gb,
-            "max_model_len": self.max_model_len,
+            "routing_state": self.routing_state,
+            "mix_weight": self.mix_weight,
+            "backends": self.backends,
         }
+        if self.worker_id:
+            payload["worker_id"] = self.worker_id
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(f"{self.serve_url}/admin/models/register", json=payload)
             resp.raise_for_status()
@@ -58,7 +65,7 @@ class SystemTester:
             print(f"✓ models: {models.json()}")
             print(f"✓ workers: {workers.json()}")
 
-    async def _get_instance_record(self) -> Dict[str, Any]:
+    async def _get_instance_record(self, backend_type: Optional[str] = None) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(f"{self.serve_url}/admin/models")
             resp.raise_for_status()
@@ -69,6 +76,11 @@ class SystemTester:
             instances = model_entry.get("instances", [])
             if not instances:
                 raise RuntimeError(f"模型无实例: {self.model_alias}")
+            if backend_type:
+                filtered = [inst for inst in instances if inst.get("backend_type") == backend_type]
+                if not filtered:
+                    raise RuntimeError(f"未找到 backend_type={backend_type} 的实例")
+                return filtered[0]
             return instances[0]
 
     async def _chat_once(self) -> httpx.Response:
@@ -109,7 +121,6 @@ class SystemTester:
         if paths_raw:
             paths = [p.strip() for p in paths_raw.split(",") if p.strip()]
         else:
-            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
             default_path = os.path.join("/root/Code/video_anomaly_analysis_system/model_pool_serve/demo.png")
             paths = [default_path] if os.path.exists(default_path) else []
         if not paths:
@@ -130,7 +141,9 @@ class SystemTester:
         return data_uris
 
     async def force_sleep(self, level: int) -> None:
-        instance = await self._get_instance_record()
+        if BACKEND_VLLM not in self.backends:
+            raise RuntimeError("当前测试配置未启用 vllm backend，无法执行 sleep/wake 测试")
+        instance = await self._get_instance_record(backend_type=BACKEND_VLLM)
         instance_alias = instance.get("instance_alias")
         control_url = instance.get("control_url") or self.worker_url
         if not instance_alias:
@@ -187,14 +200,26 @@ class SystemTester:
     async def fake_autoscaler_test(self) -> None:
         print("\n=== Fake 模型弹性调度测试 ===")
         alias = os.getenv("FAKE_MODEL_ALIAS", "fake-model")
+        fake_backend = os.getenv("FAKE_BACKEND_TYPE", BACKEND_VLLM)
+        if fake_backend not in {BACKEND_VLLM, BACKEND_LLAMA_CPP}:
+            raise RuntimeError(f"FAKE_BACKEND_TYPE 不合法: {fake_backend}")
         fake_payload = {
             "alias": alias,
-            "model_name": "__fake__",
-            "fake": True,
-            "fake_response": "FAKE_OK",
-            "fake_delay_ms": int(os.getenv("FAKE_DELAY_MS", "2000")),
-            "fake_capacity": int(os.getenv("FAKE_CAPACITY", "1")),
+            "routing_state": "VLLM_PRIMARY" if fake_backend == BACKEND_VLLM else "FAST_ONLY",
+            "backends": {
+                fake_backend: {
+                    "model_name": "__fake__",
+                    "fake": True,
+                    "fake_response": "FAKE_OK",
+                    "fake_delay_ms": int(os.getenv("FAKE_DELAY_MS", "2000")),
+                    "fake_capacity": int(os.getenv("FAKE_CAPACITY", "1")),
+                    "min_replicas": int(os.getenv("FAKE_MIN_REPLICAS", "1")),
+                    "max_replicas": int(os.getenv("FAKE_MAX_REPLICAS", "4")),
+                }
+            },
         }
+        if self.worker_id:
+            fake_payload["worker_id"] = self.worker_id
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(f"{self.serve_url}/admin/models/register", json=fake_payload)
             resp.raise_for_status()
@@ -456,17 +481,64 @@ async def main() -> None:
     serve_url = os.getenv("SERVE_URL") or (sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000")
     worker_url = os.getenv("WORKER_URL") or (sys.argv[2] if len(sys.argv) > 2 else "http://100.66.213.127:7000")
     model_alias = os.getenv("MODEL_ALIAS", "qwen3-vl-2b")
-    model_name = os.getenv("MODEL_NAME", "Qwen/Qwen3-VL-2B-Instruct")
-    gpu_memory_gb = float(os.getenv("GPU_MEMORY_GB", "12.0"))
-    max_model_len = int(os.getenv("MAX_MODEL_LEN", "4096"))
+    worker_id = os.getenv("WORKER_ID")
+    routing_state = os.getenv("ROUTING_STATE", "FAST_ONLY")
+    mix_weight = int(os.getenv("MIX_WEIGHT", "50"))
+
+    base_model_name = os.getenv("MODEL_NAME", "Qwen/Qwen3-VL-2B-Instruct")
+    base_model_path = os.getenv("MODEL_PATH")
+    base_gpu_memory_gb = float(os.getenv("GPU_MEMORY_GB", "12.0"))
+    base_max_model_len = int(os.getenv("MAX_MODEL_LEN", "4096"))
+
+    enable_llama = os.getenv("ENABLE_LLAMA_BACKEND", "1") == "1"
+    enable_vllm = os.getenv("ENABLE_VLLM_BACKEND", "1") == "1"
+    backends: Dict[str, Dict[str, Any]] = {}
+
+    if enable_llama:
+        llama_cfg: Dict[str, Any] = {
+            "model_name": os.getenv("LLAMA_MODEL_NAME", "Qwen/Qwen3-VL-2B-Instruct-GGUF"),
+            "gpu_memory_gb": float(os.getenv("LLAMA_GPU_MEMORY_GB", "6.0")),
+            "min_replicas": int(os.getenv("LLAMA_MIN_REPLICAS", "1")),
+            "max_replicas": int(os.getenv("LLAMA_MAX_REPLICAS", "4")),
+            "max_model_len": int(os.getenv("LLAMA_MAX_MODEL_LEN", str(base_max_model_len))),
+            "llama_n_gpu_layers": int(os.getenv("LLAMA_N_GPU_LAYERS", "-1")),
+        }
+        llama_model_path = os.getenv("LLAMA_MODEL_PATH", base_model_path or "")
+        if llama_model_path:
+            llama_cfg["model_path"] = llama_model_path
+        llama_filename = os.getenv("LLAMA_FILENAME", "Qwen3VL-2B-Instruct-F16.gguf")
+        if llama_filename:
+            llama_cfg["llama_filename"] = llama_filename
+        llama_mmproj_path = os.getenv("LLAMA_MMPROJ_PATH", "mmproj-Qwen3VL-2B-Instruct-F16.gguf")
+        if llama_mmproj_path:
+            llama_cfg["llama_mmproj_path"] = llama_mmproj_path
+        backends[BACKEND_LLAMA_CPP] = llama_cfg
+
+    if enable_vllm:
+        vllm_cfg: Dict[str, Any] = {
+            "model_name": os.getenv("VLLM_MODEL_NAME", base_model_name),
+            "gpu_memory_gb": float(os.getenv("VLLM_GPU_MEMORY_GB", str(base_gpu_memory_gb))),
+            "min_replicas": int(os.getenv("VLLM_MIN_REPLICAS", "0")),
+            "max_replicas": int(os.getenv("VLLM_MAX_REPLICAS", "2")),
+            "max_model_len": int(os.getenv("VLLM_MAX_MODEL_LEN", str(base_max_model_len))),
+            "tensor_parallel_size": int(os.getenv("VLLM_TENSOR_PARALLEL_SIZE", "1")),
+        }
+        vllm_model_path = os.getenv("VLLM_MODEL_PATH", base_model_path or "")
+        if vllm_model_path:
+            vllm_cfg["model_path"] = vllm_model_path
+        backends[BACKEND_VLLM] = vllm_cfg
+
+    if not backends:
+        raise RuntimeError("至少启用一个 backend：ENABLE_LLAMA_BACKEND 或 ENABLE_VLLM_BACKEND")
 
     tester = SystemTester(
         serve_url=serve_url,
         worker_url=worker_url,
         model_alias=model_alias,
-        model_name=model_name,
-        gpu_memory_gb=gpu_memory_gb,
-        max_model_len=max_model_len,
+        backends=backends,
+        routing_state=routing_state,
+        mix_weight=mix_weight,
+        worker_id=worker_id,
     )
     await tester.run()
 
